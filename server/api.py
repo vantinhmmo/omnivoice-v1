@@ -20,6 +20,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,7 +29,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import soundfile as sf
 import torch
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -171,9 +172,18 @@ def refresh_job_status(meta: Dict[str, Any]) -> Dict[str, Any]:
 
 
 ACTIVE_LONG_JOB_STATUSES = {"queued", "pending", "running"}
+TERMINAL_JOB_STATUSES = {"done", "cancelled", "stopped", "failed", "merged"}
+
+try:
+    _max_jobs_env = int(os.environ.get("OMNIVOICE_MAX_CONCURRENT_LONG_JOBS", "1"))
+except ValueError:
+    _max_jobs_env = 1
+MAX_CONCURRENT_LONG_JOBS = max(1, _max_jobs_env)
+
 JOB_SUBMIT_LOCK = JOBS_DIR / ".create_job.lock"
 SINGLE_ACTIVE_GUARD = JOBS_DIR / ".single_active_guard"
 JOB_SUBMIT_ASYNC_LOCK = asyncio.Lock()
+JOB_QUEUE_DISPATCH_LOCK = threading.Lock()
 
 
 def find_active_long_job() -> Optional[Dict[str, Any]]:
@@ -345,6 +355,92 @@ def release_job_submit_lock(lock_path: Path) -> None:
         pass
 
 
+def _sort_jobs_by_time_desc(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    jobs.sort(
+        key=lambda j: str(j.get("updated_at") or j.get("created_at") or ""),
+        reverse=True,
+    )
+    return jobs
+
+
+def _collect_jobs() -> List[Dict[str, Any]]:
+    jobs: List[Dict[str, Any]] = []
+    for path in JOBS_DIR.glob("*/job.json"):
+        try:
+            meta = refresh_job_status(read_json(path))
+            jobs.append(read_job(meta["id"]))
+        except Exception:  # noqa: BLE001
+            continue
+    return _sort_jobs_by_time_desc(jobs)
+
+
+def dispatch_next_queued_job() -> Optional[Dict[str, Any]]:
+    """Dispatch queued jobs up to MAX_CONCURRENT_LONG_JOBS."""
+    with JOB_QUEUE_DISPATCH_LOCK:
+        candidates: List[Dict[str, Any]] = []
+        running_count = 0
+
+        for path in JOBS_DIR.glob("*/job.json"):
+            try:
+                meta = refresh_job_status(read_json(path))
+                status = str(meta.get("status", "")).lower()
+                if status == "running":
+                    running_count += 1
+                elif status in {"queued", "pending"}:
+                    candidates.append(meta)
+            except Exception:  # noqa: BLE001
+                continue
+
+        slots = max(0, MAX_CONCURRENT_LONG_JOBS - running_count)
+        if slots <= 0 or not candidates:
+            return None
+
+        candidates.sort(key=lambda m: str(m.get("created_at") or m.get("updated_at") or ""))
+        dispatched: List[Dict[str, Any]] = []
+
+        for meta in candidates[:slots]:
+            job_id = str(meta.get("id") or "").strip()
+            if not job_id:
+                continue
+
+            cmd = meta.get("command")
+            if not isinstance(cmd, list) or not cmd:
+                meta["status"] = "failed"
+                meta["updated_at"] = utc_now()
+                meta["error"] = "Missing command for queued job"
+                write_json(job_meta_path(job_id), meta)
+                dispatched.append(read_job(job_id))
+                continue
+
+            log_path = Path(meta.get("log") or (job_dir(job_id) / "worker.log"))
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with log_path.open("ab") as log_file:
+                process = subprocess.Popen(
+                    cmd,
+                    cwd=str(ROOT_DIR),
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+                    start_new_session=os.name != "nt",
+                )
+
+            meta["status"] = "running"
+            meta["pid"] = process.pid
+            meta["updated_at"] = utc_now()
+            write_json(job_meta_path(job_id), meta)
+            logger.info(
+                "[queue] dispatched job: id=%s pid=%s running=%s/%s",
+                job_id,
+                process.pid,
+                running_count + len(dispatched) + 1,
+                MAX_CONCURRENT_LONG_JOBS,
+            )
+            dispatched.append(read_job(job_id))
+
+        return dispatched[0] if dispatched else None
+
+
 @app.get("/api/health")
 def health() -> Dict[str, Any]:
     return {
@@ -355,6 +451,7 @@ def health() -> Dict[str, Any]:
         "cuda": torch.cuda.is_available(),
         "model_loaded": _model is not None,
         "anti_spam_version": "guard-atomic-v1",
+        "max_concurrent_long_jobs": MAX_CONCURRENT_LONG_JOBS,
     }
 
 
@@ -432,7 +529,6 @@ async def short_tts(
 
 @app.post("/api/jobs/long")
 async def create_long_job(
-    background_tasks: BackgroundTasks,
     script_text: Optional[str] = Form(None),
     script_file: Optional[UploadFile] = File(None),
     ref_audio: Optional[UploadFile] = File(None),
@@ -456,129 +552,102 @@ async def create_long_job(
         raise HTTPException(status_code=400, detail="script_text or script_file is required")
 
     async with JOB_SUBMIT_ASYNC_LOCK:
-        acquire_single_active_guard()
+        job_id = uuid.uuid4().hex[:12]
 
-        lock_path = acquire_job_submit_lock()
-        try:
-            job_id = uuid.uuid4().hex[:12]
-            write_json(SINGLE_ACTIVE_GUARD, {"job_id": job_id, "created_at": utc_now()})
+        jdir = job_dir(job_id)
+        jdir.mkdir(parents=True, exist_ok=True)
 
-            jdir = job_dir(job_id)
-            jdir.mkdir(parents=True, exist_ok=True)
+        script_path = jdir / "script.txt"
+        if script_file and script_file.filename:
+            await save_upload(script_file, script_path)
+        else:
+            script_path.write_text(script_text or "", encoding="utf-8")
 
-            script_path = jdir / "script.txt"
-            if script_file and script_file.filename:
-                await save_upload(script_file, script_path)
-            else:
-                script_path.write_text(script_text or "", encoding="utf-8")
+        ref_path = await save_upload(ref_audio, jdir / "reference.wav")
+        output_ext = "mp3" if output_format.lower() == "mp3" else "wav"
+        output_path = jdir / f"final.{output_ext}"
+        work_dir = jdir / "work"
+        log_path = jdir / "worker.log"
 
-            ref_path = await save_upload(ref_audio, jdir / "reference.wav")
-            output_ext = "mp3" if output_format.lower() == "mp3" else "wav"
-            output_path = jdir / f"final.{output_ext}"
-            work_dir = jdir / "work"
-            log_path = jdir / "worker.log"
+        cmd: List[str] = [
+            sys.executable,
+            "-m",
+            "omnivoice.cli.long_text",
+            "--model",
+            model,
+            "--input",
+            str(script_path),
+            "--output",
+            str(output_path),
+            "--work_dir",
+            str(work_dir),
+            "--num_step",
+            str(num_step),
+            "--max_chars",
+            str(max_chars),
+            "--min_chars",
+            str(min_chars),
+            "--guidance_scale",
+            str(guidance_scale),
+            "--speed",
+            str(speed),
+            "--smart_pause",
+            str(smart_pause).lower(),
+            "--pause_scale",
+            str(pause_scale),
+            "--comma_pause",
+            str(comma_pause),
+            "--sentence_pause",
+            str(sentence_pause),
+            "--paragraph_pause",
+            str(paragraph_pause),
+            "--postprocess_output",
+            str(postprocess_output).lower(),
+            "--device",
+            DEFAULT_DEVICE,
+            "--dtype",
+            DEFAULT_DTYPE,
+            "--resume",
+            "true",
+        ]
+        if language:
+            cmd += ["--language", language]
+        if ref_path is not None:
+            cmd += ["--ref_audio", str(ref_path)]
+        if ref_text:
+            cmd += ["--ref_text", ref_text]
 
-            cmd: List[str] = [
-                sys.executable,
-                "-m",
-                "omnivoice.cli.long_text",
-                "--model",
-                model,
-                "--input",
-                str(script_path),
-                "--output",
-                str(output_path),
-                "--work_dir",
-                str(work_dir),
-                "--num_step",
-                str(num_step),
-                "--max_chars",
-                str(max_chars),
-                "--min_chars",
-                str(min_chars),
-                "--guidance_scale",
-                str(guidance_scale),
-                "--speed",
-                str(speed),
-                "--smart_pause",
-                str(smart_pause).lower(),
-                "--pause_scale",
-                str(pause_scale),
-                "--comma_pause",
-                str(comma_pause),
-                "--sentence_pause",
-                str(sentence_pause),
-                "--paragraph_pause",
-                str(paragraph_pause),
-                "--postprocess_output",
-                str(postprocess_output).lower(),
-                "--device",
-                DEFAULT_DEVICE,
-                "--dtype",
-                DEFAULT_DTYPE,
-                "--resume",
-                "true",
-            ]
-            if language:
-                cmd += ["--language", language]
-            if ref_path is not None:
-                cmd += ["--ref_audio", str(ref_path)]
-            if ref_text:
-                cmd += ["--ref_text", ref_text]
+        meta = {
+            "id": job_id,
+            "status": "queued",
+            "pid": None,
+            "created_at": utc_now(),
+            "updated_at": utc_now(),
+            "script": str(script_path),
+            "reference": str(ref_path) if ref_path else None,
+            "output": str(output_path),
+            "work_dir": str(work_dir),
+            "log": str(log_path),
+            "command": cmd,
+        }
+        write_json(job_meta_path(job_id), meta)
 
-            log_file = log_path.open("ab")
-            process = subprocess.Popen(
-                cmd,
-                cwd=str(ROOT_DIR),
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
-                start_new_session=os.name != "nt",
-            )
-            background_tasks.add_task(log_file.close)
-
-            meta = {
-                "id": job_id,
-                "status": "running",
-                "pid": process.pid,
-                "created_at": utc_now(),
-                "updated_at": utc_now(),
-                "script": str(script_path),
-                "reference": str(ref_path) if ref_path else None,
-                "output": str(output_path),
-                "work_dir": str(work_dir),
-                "log": str(log_path),
-                "command": cmd,
-            }
-            write_json(job_meta_path(job_id), meta)
-            return read_job(job_id)
-        finally:
-            release_job_submit_lock(lock_path)
-            if not SINGLE_ACTIVE_GUARD.exists():
-                pass
+    # Trigger dispatcher: nếu rảnh sẽ tự chuyển queued -> running.
+    dispatch_next_queued_job()
+    return read_job(job_id)
 
 
 @app.get("/api/jobs")
 def list_jobs() -> Dict[str, Any]:
-    jobs: List[Dict[str, Any]] = []
-    for path in JOBS_DIR.glob("*/job.json"):
-        try:
-            meta = refresh_job_status(read_json(path))
-            jobs.append(read_job(meta["id"]))
-        except Exception:  # noqa: BLE001
-            continue
-
-    # Trả về theo updated_at mới nhất để frontend luôn nhận đúng job mới nhất.
-    jobs.sort(
-        key=lambda j: str(j.get("updated_at") or j.get("created_at") or ""),
-        reverse=True,
-    )
-    return {"jobs": jobs}
+    dispatch_next_queued_job()
+    return {"jobs": _collect_jobs()}
 
 
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str) -> Dict[str, Any]:
-    return refresh_job_status(read_job(job_id))
+    job = refresh_job_status(read_job(job_id))
+    dispatch_next_queued_job()
+    return read_job(str(job.get("id") or job_id))
 
 
 @app.post("/api/jobs/{job_id}/cancel")
@@ -654,14 +723,7 @@ def cancel_job(job_id: str) -> Dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             logger.warning("[cancel_job] manifest normalize failed: job_id=%s error=%s", job_id, exc)
 
-    try:
-        if SINGLE_ACTIVE_GUARD.exists():
-            raw = read_json(SINGLE_ACTIVE_GUARD)
-            if str(raw.get("job_id") or "") == str(job_id):
-                SINGLE_ACTIVE_GUARD.unlink(missing_ok=True)
-                logger.info("[cancel_job] released SINGLE_ACTIVE_GUARD for job_id=%s", job_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("[cancel_job] failed to release guard for job_id=%s: %s", job_id, exc)
+    dispatch_next_queued_job()
 
     updated = read_job(job_id)
     logger.info(
