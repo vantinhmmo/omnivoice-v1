@@ -194,14 +194,25 @@ export default function App() {
   const draftRows = useMemo(() => splitPreview(scriptText, Number(settings.max_chars) || 1200), [scriptText, settings.max_chars]);
   const latestJobRows = useMemo(() => (latestJob ? jobRows(latestJob) : []), [latestJob]);
   const rows = viewMode === 'job' ? (latestJobRows.length ? latestJobRows : draftRows) : draftRows;
-  const runningJobs = useMemo(() => jobs.some((j) => j.status === 'running'), [jobs]);
+
+  const activeStatuses = ['running', 'queued', 'pending'] as const;
+  const terminalStatuses = ['cancelled', 'stopped', 'done', 'failed', 'merged'] as const;
+  const isActiveStatus = (status?: string | null) => activeStatuses.includes(String(status ?? '').toLowerCase() as (typeof activeStatuses)[number]);
+  const isTerminalStatus = (status?: string | null) => terminalStatuses.includes(String(status ?? '').toLowerCase() as (typeof terminalStatuses)[number]);
+
+  const runningJobs = useMemo(() => jobs.some((j) => isActiveStatus(j.status)), [jobs]);
+  const latestJobHasActiveChunks = useMemo(() => {
+    if (!latestJob) return false;
+    if (isTerminalStatus(latestJob.status)) return false;
+    return (latestJob.manifest?.chunks ?? []).some((c) => isActiveStatus(c.status));
+  }, [latestJob]);
   const summary = latestJob?.manifest?.summary;
   const progress = pct(latestJob);
-  const creatingJob = busy;
-  const activeJob = useMemo(
-    () => jobs.find((j) => ['running', 'queued', 'pending'].includes(j.status)) ?? null,
-    [jobs]
-  );
+  const activeJob = useMemo(() => jobs.find((j) => isActiveStatus(j.status)) ?? null, [jobs]);
+  const creatingJob = busy || runningJobs || latestJobHasActiveChunks || !!activeJob;
+  const canStopJob = !!latestJob && isActiveStatus(latestJob.status);
+
+  const debugEnabled = false;
 
   function flash(message: string, type: 'ok' | 'error' = 'ok') {
     setToast({ message, type });
@@ -275,11 +286,34 @@ export default function App() {
   async function refreshJobs() {
     try {
       const next = await listJobs();
-      const one = next.slice(0, 1);
+
+      // Ưu tiên job active; nếu không có thì chọn job mới nhất theo updated_at.
+      const active = next.find((j) => isActiveStatus(j.status)) ?? null;
+      const newest = [...next].sort((a, b) => {
+        const ta = Date.parse(String(a.updated_at ?? a.created_at ?? '')) || 0;
+        const tb = Date.parse(String(b.updated_at ?? b.created_at ?? '')) || 0;
+        return tb - ta;
+      })[0] ?? null;
+      const preferred = active ?? newest;
+      const one = preferred ? [preferred] : [];
+
+      if (debugEnabled) {
+        console.debug('[UI][refreshJobs] fetched', {
+          count: next.length,
+          picked: one[0]
+            ? {
+                id: one[0].id,
+                status: one[0].status,
+                chunkStatuses: (one[0].manifest?.chunks ?? []).map((c) => c.status),
+              }
+            : null,
+        });
+      }
       setJobs(one);
       if (!one.length) setViewMode('draft');
     } catch (err) {
       console.error(err);
+      if (debugEnabled) console.debug('[UI][refreshJobs] error', err);
     }
   }
 
@@ -338,11 +372,24 @@ export default function App() {
   }
 
   async function submitJob() {
+    if (debugEnabled) {
+      console.debug('[UI][submitJob] click', {
+        submitLockRef: submitLockRef.current,
+        busy,
+        submitUiLocked,
+        runningJobs,
+        latestJobHasActiveChunks,
+        activeJobId: activeJob?.id ?? null,
+        latestJobStatus: latestJob?.status ?? null,
+        creatingJob,
+        canStopJob,
+      });
+    }
     if (submitLockRef.current || busy || submitUiLocked) {
       flash('Yêu cầu tạo job đang được xử lý, vui lòng chờ.', 'error');
       return;
     }
-    if (activeJob || runningJobs) {
+    if (activeJob || runningJobs || latestJobHasActiveChunks) {
       flash('Đang có job hoạt động. Chỉ được chạy 1 job tại 1 thời điểm.', 'error');
       return;
     }
@@ -363,8 +410,10 @@ export default function App() {
       const refFile = refAudioRef.current?.files?.[0];
       if (refFile) form.set('ref_audio', refFile);
       const job = await createLongJob(form);
-      await refreshJobs();
+      if (debugEnabled) console.debug('[UI][submitJob] createLongJob response', { id: job.id, status: job.status });
+      setJobs([job]);
       setViewMode('job');
+      await refreshJobs();
       flash(`Đã tạo job ${job.id}`, 'ok');
     } catch (err) {
       flash(err instanceof Error ? err.message : String(err), 'error');
@@ -376,10 +425,38 @@ export default function App() {
   }
 
   async function stopJob() {
-    if (!latestJob || latestJob.status !== 'running') return;
-    await cancelJob(latestJob.id);
-    refreshJobs();
-    flash(`Đã gửi lệnh dừng job ${latestJob.id}`, 'ok');
+    if (debugEnabled) {
+      console.debug('[UI][stopJob] click', {
+        latestJobId: latestJob?.id ?? null,
+        latestJobStatus: latestJob?.status ?? null,
+        canStopJob,
+        latestJobHasActiveChunks,
+      });
+    }
+    if (!latestJob || !canStopJob) {
+      if (debugEnabled) {
+        console.debug('[UI][stopJob] early-return', {
+          reason: !latestJob ? 'no-latest-job' : 'canStopJob=false',
+          latestJobId: latestJob?.id ?? null,
+          latestJobStatus: latestJob?.status ?? null,
+          canStopJob,
+          latestJobHasActiveChunks,
+          runningJobs,
+          activeJobId: activeJob?.id ?? null,
+        });
+      }
+      return;
+    }
+    try {
+      const cancelled = await cancelJob(latestJob.id);
+      if (debugEnabled) console.debug('[UI][stopJob] cancel response', { id: cancelled.id, status: cancelled.status });
+      setJobs([cancelled]);
+      await refreshJobs();
+      flash(`Đã gửi lệnh dừng job ${latestJob.id}`, 'ok');
+    } catch (err) {
+      flash(err instanceof Error ? err.message : String(err), 'error');
+      if (debugEnabled) console.debug('[UI][stopJob] error', err);
+    }
   }
 
   useEffect(() => {
@@ -407,6 +484,26 @@ export default function App() {
       if (refAudioPreviewUrl) URL.revokeObjectURL(refAudioPreviewUrl);
     };
   }, [refAudioPreviewUrl]);
+
+  useEffect(() => {
+    if (!debugEnabled) return;
+    console.debug('[UI][state]', {
+      jobs: jobs.map((j) => ({
+        id: j.id,
+        status: j.status,
+        chunkStatuses: (j.manifest?.chunks ?? []).map((c) => c.status),
+      })),
+      latestJobId: latestJob?.id ?? null,
+      latestJobStatus: latestJob?.status ?? null,
+      runningJobs,
+      latestJobHasActiveChunks,
+      activeJobId: activeJob?.id ?? null,
+      busy,
+      submitUiLocked,
+      creatingJob,
+      canStopJob,
+    });
+  }, [jobs, latestJob, runningJobs, latestJobHasActiveChunks, activeJob, busy, submitUiLocked, creatingJob, canStopJob]);
 
   return (
     <main className="app">
@@ -527,15 +624,21 @@ export default function App() {
             </div>
 
             <div className="run-actions">
-              <button type="button" className="btn primary" onClick={submitJob} disabled={submitUiLocked || busy || runningJobs || !!activeJob}>
+              <button
+                type="button"
+                className="btn primary"
+                onClick={submitJob}
+                disabled={submitUiLocked || busy || runningJobs || latestJobHasActiveChunks || !!activeJob}
+                aria-busy={creatingJob}
+              >
                 {creatingJob ? (
                   <>
                     <span className="btn-spinner" aria-hidden="true" />
-                    Đang gửi job...
+                    Đang tạo voice...
                   </>
                 ) : 'Tạo âm thanh'}
               </button>
-              <button type="button" className="btn danger" onClick={stopJob} disabled={!latestJob || latestJob.status !== 'running'}>Dừng job</button>
+              <button type="button" className="btn danger" onClick={stopJob} disabled={!canStopJob}>Dừng job</button>
               {latestJob?.output_exists && (
                 <a className="btn success" href={downloadUrl(latestJob.id)}>Tải audio</a>
               )}
@@ -547,7 +650,11 @@ export default function App() {
             {creatingJob && (
               <div className="pending-box" role="status" aria-live="polite">
                 <span className="pending-dot" />
-                <span>Đang tạo job trên server, vui lòng chờ...</span>
+                <span>
+                  {busy
+                    ? 'Đang tạo job trên server, vui lòng chờ...'
+                    : 'Voice đang được render, vui lòng chờ job hoàn tất hoặc bấm Dừng job.'}
+                </span>
               </div>
             )}
 

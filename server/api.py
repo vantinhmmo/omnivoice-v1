@@ -13,7 +13,9 @@ Run:
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -54,6 +56,7 @@ app.add_middleware(
 
 _model: Optional[OmniVoice] = None
 _sampling_rate: Optional[int] = None
+logger = logging.getLogger("omnivoice.api")
 
 
 def utc_now() -> str:
@@ -169,13 +172,26 @@ def refresh_job_status(meta: Dict[str, Any]) -> Dict[str, Any]:
 
 ACTIVE_LONG_JOB_STATUSES = {"queued", "pending", "running"}
 JOB_SUBMIT_LOCK = JOBS_DIR / ".create_job.lock"
+SINGLE_ACTIVE_GUARD = JOBS_DIR / ".single_active_guard"
+JOB_SUBMIT_ASYNC_LOCK = asyncio.Lock()
 
 
 def find_active_long_job() -> Optional[Dict[str, Any]]:
+    """Strict single-job guard with stale-running cleanup."""
+    terminal_statuses = {"done", "cancelled", "stopped", "failed"}
     for path in sorted(JOBS_DIR.glob("*/job.json"), reverse=True):
         try:
-            meta = refresh_job_status(read_json(path))
-            if meta.get("status") in ACTIVE_LONG_JOB_STATUSES:
+            meta = read_json(path)
+            status = str(meta.get("status", "")).lower()
+
+            # Nếu job được ghi running nhưng PID không còn sống thì coi là stopped.
+            if status == "running" and not is_pid_running(meta.get("pid")):
+                meta["status"] = "stopped"
+                meta["updated_at"] = utc_now()
+                write_json(path, meta)
+                status = "stopped"
+
+            if status not in terminal_statuses:
                 return read_job(meta["id"])
         except Exception:  # noqa: BLE001
             continue
@@ -192,6 +208,69 @@ def _raise_active_job(active: Optional[Dict[str, Any]] = None) -> None:
     raise HTTPException(status_code=409, detail=detail)
 
 
+def acquire_single_active_guard() -> None:
+    """Acquire cross-process guard so only one long job can be created/run.
+
+    Includes stale-guard recovery to avoid permanent lock after crash/restart.
+    """
+    try:
+        fd = os.open(str(SINGLE_ACTIVE_GUARD), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        stale = False
+        try:
+            raw = read_json(SINGLE_ACTIVE_GUARD)
+            job_id = str(raw.get("job_id") or "").strip()
+            created_at = raw.get("created_at")
+
+            if job_id:
+                jpath = job_meta_path(job_id)
+                if not jpath.exists():
+                    stale = True
+                else:
+                    meta = read_json(jpath)
+                    status = str(meta.get("status", "")).lower()
+                    if status == "running" and not is_pid_running(meta.get("pid")):
+                        meta["status"] = "stopped"
+                        meta["updated_at"] = utc_now()
+                        write_json(jpath, meta)
+                        status = "stopped"
+                    stale = status in {"done", "cancelled", "stopped", "failed"}
+            elif isinstance(created_at, str):
+                dt = datetime.fromisoformat(created_at)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                age_seconds = (datetime.now(timezone.utc) - dt).total_seconds()
+                stale = age_seconds > 120
+        except Exception:  # noqa: BLE001
+            stale = False
+
+        if stale:
+            try:
+                SINGLE_ACTIVE_GUARD.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                fd = os.open(str(SINGLE_ACTIVE_GUARD), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "Đang có job hoạt động. Vui lòng chờ job xong hoặc bấm Dừng job trước khi tạo job mới.",
+                    },
+                )
+        else:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Đang có job hoạt động. Vui lòng chờ job xong hoặc bấm Dừng job trước khi tạo job mới.",
+                },
+            )
+
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"created_at": utc_now()}, f)
+
+
+
 def acquire_job_submit_lock() -> Path:
     active = find_active_long_job()
     if active:
@@ -200,20 +279,62 @@ def acquire_job_submit_lock() -> Path:
     try:
         fd = os.open(str(JOB_SUBMIT_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
+        # Lock tồn tại: có thể là request tạo job đang diễn ra hoặc lock cũ.
+        lock_is_stale = False
+        try:
+            raw = json.loads(JOB_SUBMIT_LOCK.read_text(encoding="utf-8"))
+            created_at = raw.get("created_at")
+            if isinstance(created_at, str):
+                dt = datetime.fromisoformat(created_at)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                age_seconds = (datetime.now(timezone.utc) - dt).total_seconds()
+                lock_is_stale = age_seconds > 120
+        except Exception:  # noqa: BLE001
+            # Không đọc được lock file => coi như lock còn hiệu lực ngắn hạn.
+            lock_is_stale = False
+
         active = find_active_long_job()
         if active:
             _raise_active_job(active)
+
+        if not lock_is_stale:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Hệ thống đang xử lý yêu cầu tạo job trước đó. Vui lòng chờ vài giây rồi thử lại.",
+                },
+            )
+
+        # Chỉ dọn lock nếu xác định là lock cũ.
         try:
             JOB_SUBMIT_LOCK.unlink()
         except OSError:
             pass
+
         try:
             fd = os.open(str(JOB_SUBMIT_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
-            _raise_active_job()
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Hệ thống đang xử lý yêu cầu tạo job trước đó. Vui lòng chờ vài giây rồi thử lại.",
+                },
+            )
 
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump({"created_at": utc_now()}, f)
+
+    # Re-check sau khi đã giữ lock để chặn race:
+    # request B có thể đã qua pre-check trước khi request A ghi job.json.
+    active_after_lock = find_active_long_job()
+    if active_after_lock:
+        try:
+            JOB_SUBMIT_LOCK.unlink()
+        except OSError:
+            pass
+        _raise_active_job(active_after_lock)
+
     return JOB_SUBMIT_LOCK
 
 
@@ -233,6 +354,7 @@ def health() -> Dict[str, Any]:
         "dtype": DEFAULT_DTYPE,
         "cuda": torch.cuda.is_available(),
         "model_loaded": _model is not None,
+        "anti_spam_version": "guard-atomic-v1",
     }
 
 
@@ -333,109 +455,124 @@ async def create_long_job(
     if not script_text and (script_file is None or not script_file.filename):
         raise HTTPException(status_code=400, detail="script_text or script_file is required")
 
-    lock_path = acquire_job_submit_lock()
-    job_id = uuid.uuid4().hex[:12]
-    jdir = job_dir(job_id)
-    jdir.mkdir(parents=True, exist_ok=True)
+    async with JOB_SUBMIT_ASYNC_LOCK:
+        acquire_single_active_guard()
 
-    script_path = jdir / "script.txt"
-    if script_file and script_file.filename:
-        await save_upload(script_file, script_path)
-    else:
-        script_path.write_text(script_text or "", encoding="utf-8")
+        lock_path = acquire_job_submit_lock()
+        try:
+            job_id = uuid.uuid4().hex[:12]
+            write_json(SINGLE_ACTIVE_GUARD, {"job_id": job_id, "created_at": utc_now()})
 
-    ref_path = await save_upload(ref_audio, jdir / "reference.wav")
-    output_ext = "mp3" if output_format.lower() == "mp3" else "wav"
-    output_path = jdir / f"final.{output_ext}"
-    work_dir = jdir / "work"
-    log_path = jdir / "worker.log"
+            jdir = job_dir(job_id)
+            jdir.mkdir(parents=True, exist_ok=True)
 
-    cmd: List[str] = [
-        sys.executable,
-        "-m",
-        "omnivoice.cli.long_text",
-        "--model",
-        model,
-        "--input",
-        str(script_path),
-        "--output",
-        str(output_path),
-        "--work_dir",
-        str(work_dir),
-        "--num_step",
-        str(num_step),
-        "--max_chars",
-        str(max_chars),
-        "--min_chars",
-        str(min_chars),
-        "--guidance_scale",
-        str(guidance_scale),
-        "--speed",
-        str(speed),
-        "--smart_pause",
-        str(smart_pause).lower(),
-        "--pause_scale",
-        str(pause_scale),
-        "--comma_pause",
-        str(comma_pause),
-        "--sentence_pause",
-        str(sentence_pause),
-        "--paragraph_pause",
-        str(paragraph_pause),
-        "--postprocess_output",
-        str(postprocess_output).lower(),
-        "--device",
-        DEFAULT_DEVICE,
-        "--dtype",
-        DEFAULT_DTYPE,
-        "--resume",
-        "true",
-    ]
-    if language:
-        cmd += ["--language", language]
-    if ref_path is not None:
-        cmd += ["--ref_audio", str(ref_path)]
-    if ref_text:
-        cmd += ["--ref_text", ref_text]
+            script_path = jdir / "script.txt"
+            if script_file and script_file.filename:
+                await save_upload(script_file, script_path)
+            else:
+                script_path.write_text(script_text or "", encoding="utf-8")
 
-    log_file = log_path.open("ab")
-    process = subprocess.Popen(
-        cmd,
-        cwd=str(ROOT_DIR),
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
-        start_new_session=os.name != "nt",
-    )
-    background_tasks.add_task(log_file.close)
+            ref_path = await save_upload(ref_audio, jdir / "reference.wav")
+            output_ext = "mp3" if output_format.lower() == "mp3" else "wav"
+            output_path = jdir / f"final.{output_ext}"
+            work_dir = jdir / "work"
+            log_path = jdir / "worker.log"
 
-    meta = {
-        "id": job_id,
-        "status": "running",
-        "pid": process.pid,
-        "created_at": utc_now(),
-        "updated_at": utc_now(),
-        "script": str(script_path),
-        "reference": str(ref_path) if ref_path else None,
-        "output": str(output_path),
-        "work_dir": str(work_dir),
-        "log": str(log_path),
-        "command": cmd,
-    }
-    write_json(job_meta_path(job_id), meta)
-    release_job_submit_lock(lock_path)
-    return read_job(job_id)
+            cmd: List[str] = [
+                sys.executable,
+                "-m",
+                "omnivoice.cli.long_text",
+                "--model",
+                model,
+                "--input",
+                str(script_path),
+                "--output",
+                str(output_path),
+                "--work_dir",
+                str(work_dir),
+                "--num_step",
+                str(num_step),
+                "--max_chars",
+                str(max_chars),
+                "--min_chars",
+                str(min_chars),
+                "--guidance_scale",
+                str(guidance_scale),
+                "--speed",
+                str(speed),
+                "--smart_pause",
+                str(smart_pause).lower(),
+                "--pause_scale",
+                str(pause_scale),
+                "--comma_pause",
+                str(comma_pause),
+                "--sentence_pause",
+                str(sentence_pause),
+                "--paragraph_pause",
+                str(paragraph_pause),
+                "--postprocess_output",
+                str(postprocess_output).lower(),
+                "--device",
+                DEFAULT_DEVICE,
+                "--dtype",
+                DEFAULT_DTYPE,
+                "--resume",
+                "true",
+            ]
+            if language:
+                cmd += ["--language", language]
+            if ref_path is not None:
+                cmd += ["--ref_audio", str(ref_path)]
+            if ref_text:
+                cmd += ["--ref_text", ref_text]
+
+            log_file = log_path.open("ab")
+            process = subprocess.Popen(
+                cmd,
+                cwd=str(ROOT_DIR),
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+                start_new_session=os.name != "nt",
+            )
+            background_tasks.add_task(log_file.close)
+
+            meta = {
+                "id": job_id,
+                "status": "running",
+                "pid": process.pid,
+                "created_at": utc_now(),
+                "updated_at": utc_now(),
+                "script": str(script_path),
+                "reference": str(ref_path) if ref_path else None,
+                "output": str(output_path),
+                "work_dir": str(work_dir),
+                "log": str(log_path),
+                "command": cmd,
+            }
+            write_json(job_meta_path(job_id), meta)
+            return read_job(job_id)
+        finally:
+            release_job_submit_lock(lock_path)
+            if not SINGLE_ACTIVE_GUARD.exists():
+                pass
 
 
 @app.get("/api/jobs")
 def list_jobs() -> Dict[str, Any]:
     jobs: List[Dict[str, Any]] = []
-    for path in sorted(JOBS_DIR.glob("*/job.json"), reverse=True):
+    for path in JOBS_DIR.glob("*/job.json"):
         try:
             meta = refresh_job_status(read_json(path))
             jobs.append(read_job(meta["id"]))
         except Exception:  # noqa: BLE001
             continue
+
+    # Trả về theo updated_at mới nhất để frontend luôn nhận đúng job mới nhất.
+    jobs.sort(
+        key=lambda j: str(j.get("updated_at") or j.get("created_at") or ""),
+        reverse=True,
+    )
     return {"jobs": jobs}
 
 
@@ -446,17 +583,95 @@ def get_job(job_id: str) -> Dict[str, Any]:
 
 @app.post("/api/jobs/{job_id}/cancel")
 def cancel_job(job_id: str) -> Dict[str, Any]:
+    logger.info("[cancel_job] request received: job_id=%s", job_id)
+
     meta = read_job(job_id)
     pid = meta.get("pid")
-    if pid and is_pid_running(pid):
+    was_running = bool(pid and is_pid_running(pid))
+    logger.info(
+        "[cancel_job] before kill: job_id=%s status=%s pid=%s is_running=%s",
+        job_id,
+        meta.get("status"),
+        pid,
+        was_running,
+    )
+
+    if was_running:
         if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], check=False)
+            result = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            logger.info(
+                "[cancel_job] taskkill result: job_id=%s pid=%s returncode=%s stdout=%s stderr=%s",
+                job_id,
+                pid,
+                result.returncode,
+                (result.stdout or "").strip(),
+                (result.stderr or "").strip(),
+            )
         else:
             os.killpg(pid, signal.SIGTERM)
+            logger.info("[cancel_job] sent SIGTERM to process group: job_id=%s pid=%s", job_id, pid)
+
+    is_running_after = bool(pid and is_pid_running(pid))
+    logger.info(
+        "[cancel_job] after kill check: job_id=%s pid=%s is_running=%s",
+        job_id,
+        pid,
+        is_running_after,
+    )
+
     meta["status"] = "cancelled"
     meta["updated_at"] = utc_now()
     write_json(job_meta_path(job_id), meta)
-    return read_job(job_id)
+
+    # Đồng bộ manifest để UI không giữ trạng thái chunk "running" sau khi cancel.
+    mpath = manifest_path(job_id)
+    if mpath.exists():
+        try:
+            manifest = read_json(mpath)
+            chunks = manifest.get("chunks") or []
+            active_chunk_statuses = {"running", "queued", "pending"}
+            for chunk in chunks:
+                st = str(chunk.get("status", "")).lower()
+                if st in active_chunk_statuses:
+                    chunk["status"] = "cancelled"
+                    chunk["updated_at"] = utc_now()
+                    if chunk.get("error") in (None, ""):
+                        chunk["error"] = "Cancelled by user"
+
+            summary = manifest.get("summary") or {}
+            summary["final_status"] = "cancelled"
+            summary["completed_chunks"] = sum(1 for c in chunks if str(c.get("status", "")).lower() in {"done", "merged"})
+            summary["failed_chunks"] = sum(1 for c in chunks if str(c.get("status", "")).lower() in {"failed", "cancelled", "stopped"})
+            manifest["summary"] = summary
+            manifest["updated_at"] = utc_now()
+            write_json(mpath, manifest)
+            logger.info("[cancel_job] manifest normalized to cancelled: job_id=%s", job_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[cancel_job] manifest normalize failed: job_id=%s error=%s", job_id, exc)
+
+    try:
+        if SINGLE_ACTIVE_GUARD.exists():
+            raw = read_json(SINGLE_ACTIVE_GUARD)
+            if str(raw.get("job_id") or "") == str(job_id):
+                SINGLE_ACTIVE_GUARD.unlink(missing_ok=True)
+                logger.info("[cancel_job] released SINGLE_ACTIVE_GUARD for job_id=%s", job_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[cancel_job] failed to release guard for job_id=%s: %s", job_id, exc)
+
+    updated = read_job(job_id)
+    logger.info(
+        "[cancel_job] response: job_id=%s status=%s output_exists=%s log_exists=%s",
+        job_id,
+        updated.get("status"),
+        updated.get("output_exists"),
+        updated.get("log_exists"),
+    )
+    return updated
 
 
 @app.get("/api/jobs/{job_id}/download")

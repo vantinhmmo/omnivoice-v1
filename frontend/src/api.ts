@@ -31,9 +31,17 @@ export async function listJobs(): Promise<LongJob[]> {
 }
 
 export async function cancelJob(id: string): Promise<LongJob> {
+  console.debug('[UI][api.cancelJob] request', { id, url: `/api/jobs/${id}/cancel` });
   const res = await fetch(`/api/jobs/${id}/cancel`, { method: 'POST' });
-  if (!res.ok) throw new Error(await res.text());
-  return res.json();
+  console.debug('[UI][api.cancelJob] response-meta', { id, ok: res.ok, status: res.status });
+  if (!res.ok) {
+    const message = await res.text();
+    console.debug('[UI][api.cancelJob] response-error', { id, message });
+    throw new Error(message);
+  }
+  const data = await res.json();
+  console.debug('[UI][api.cancelJob] response-json', { id: data?.id, status: data?.status });
+  return data;
 }
 
 export function downloadUrl(id: string): string {

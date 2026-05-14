@@ -1,0 +1,8 @@
+HEALTH_STATUS=200
+HEALTH_BODY={"ok":true,"model":"k2-fsa/OmniVoice","device":"cpu","dtype":"auto","cuda":false,"model_loaded":false,"anti_spam_version":"guard-atomic-v1"}
+LIST_STATUS=200
+CANCELLED=[]
+R1_STATUS=409
+R1_BODY={"detail":{"message":"Đang có job hoạt động. Vui lòng chờ job xong hoặc bấm Dừng job trước khi tạo job mới."}}
+R2_STATUS=409
+R2_BODY={"detail":{"message":"Đang có job hoạt động. Vui lòng chờ job xong hoặc bấm Dừng job trước khi tạo job mới."}}
