@@ -517,11 +517,12 @@ def main(argv=None) -> int:
     if not checkpoint:
         parser.print_help()
         return 0
-    logging.info(f"Loading model from {checkpoint}, device={device} ...")
+    dtype = torch.float16 if str(device).startswith("cuda") else torch.float32
+    logging.info(f"Loading model from {checkpoint}, device={device}, dtype={dtype} ...")
     model = OmniVoice.from_pretrained(
         checkpoint,
         device_map=device,
-        dtype=torch.float16,
+        dtype=dtype,
         load_asr=not args.no_asr,
     )
     print("Model loaded.")
