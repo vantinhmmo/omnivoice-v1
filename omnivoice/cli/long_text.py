@@ -51,12 +51,21 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class TextChunkPlan:
+    text: str
+    paragraph_end: bool = False
+
+
+@dataclass
 class ChunkRecord:
     idx: int
     text: str
     wav: str
     status: str = "pending"
     chars: int = 0
+    pause_after: float = 0.0
+    pause_reason: str = "none"
+    paragraph_end: bool = False
     duration: Optional[float] = None
     elapsed: Optional[float] = None
     error: Optional[str] = None
@@ -117,45 +126,87 @@ def split_oversized_chunk(text: str, max_chars: int) -> List[str]:
     return chunks
 
 
+def _last_meaningful_char(text: str) -> str:
+    """Return the last punctuation/content char, ignoring closing quotes/brackets."""
+    stripped = text.strip()
+    closing_marks = set("\"'”’)]}）】》」』>、 ")
+    while stripped and stripped[-1] in closing_marks:
+        stripped = stripped[:-1].rstrip()
+    return stripped[-1] if stripped else ""
+
+
+def infer_pause_after(text: str, paragraph_end: bool, args: argparse.Namespace) -> tuple[float, str]:
+    """Infer a natural pause after a chunk from its final punctuation."""
+    if not args.smart_pause:
+        return max(0.0, float(args.silence_between_chunks)), "fixed"
+
+    tail = text.strip()
+    last_char = _last_meaningful_char(tail)
+    if tail.endswith("...") or tail.endswith("…") or tail.endswith("……"):
+        pause, reason = args.ellipsis_pause, "ellipsis"
+    elif last_char in {",", "，", "、"}:
+        pause, reason = args.comma_pause, "comma"
+    elif last_char in {";", ":", "；", "："}:
+        pause, reason = args.semicolon_pause, "semicolon"
+    elif last_char in {"?", "!", "？", "！"}:
+        pause, reason = args.question_pause, "question_exclamation"
+    elif last_char in {".", "。"}:
+        pause, reason = args.sentence_pause, "sentence"
+    else:
+        pause, reason = args.default_pause, "default"
+
+    if paragraph_end:
+        pause = max(float(pause), float(args.paragraph_pause))
+        reason = f"paragraph_{reason}"
+
+    return max(0.0, float(pause) * float(args.pause_scale)), reason
+
+
 def split_long_text(
     text: str,
     max_chars: int = 1200,
     min_chars: int = 120,
-) -> List[str]:
+) -> List[TextChunkPlan]:
     """Split a long script into model-friendly chunks.
 
     The function first preserves paragraph boundaries, then uses the project's
     punctuation-aware splitter, and finally hard-splits oversized chunks as a
-    safety net.
+    safety net.  Each returned item records whether it ends a paragraph so the
+    final merge can insert a more natural pause.
     """
     text = normalize_script_text(text)
     if not text:
         raise ValueError("Input text is empty.")
 
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-    chunks: List[str] = []
+    plans: List[TextChunkPlan] = []
 
     for paragraph in paragraphs:
-        paragraph_chunks = chunk_text_punctuation(
+        paragraph_chunks: List[str] = []
+        for chunk in chunk_text_punctuation(
             paragraph,
             chunk_len=max_chars,
             min_chunk_len=min_chars,
-        )
-        for chunk in paragraph_chunks:
-            chunks.extend(split_oversized_chunk(chunk, max_chars=max_chars))
+        ):
+            paragraph_chunks.extend(split_oversized_chunk(chunk, max_chars=max_chars))
 
-    # Merge tiny trailing chunks with previous chunks when possible.
-    merged: List[str] = []
-    for chunk in chunks:
-        chunk = add_punctuation(chunk.strip())
-        if not chunk:
-            continue
-        if merged and len(chunk) < min_chars and len(merged[-1]) + 1 + len(chunk) <= max_chars:
-            merged[-1] = f"{merged[-1]} {chunk}"
-        else:
-            merged.append(chunk)
+        for i, chunk in enumerate(paragraph_chunks):
+            chunk = add_punctuation(chunk.strip())
+            if not chunk:
+                continue
+            paragraph_end = i == len(paragraph_chunks) - 1
+            if (
+                plans
+                and len(chunk) < min_chars
+                and not plans[-1].paragraph_end
+                and len(plans[-1].text) + 1 + len(chunk) <= max_chars
+            ):
+                plans[-1].text = f"{plans[-1].text} {chunk}"
+                plans[-1].paragraph_end = paragraph_end
+            else:
+                plans.append(TextChunkPlan(text=chunk, paragraph_end=paragraph_end))
 
-    return merged
+    return plans
 
 
 def atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
@@ -173,19 +224,27 @@ def read_text_file(path: Path) -> str:
 
 def make_manifest(
     args: argparse.Namespace,
-    chunks: List[str],
+    chunks: List[TextChunkPlan],
     chunks_dir: Path,
 ) -> Dict[str, Any]:
     records = []
     for idx, chunk in enumerate(chunks):
         wav_path = chunks_dir / f"chunk_{idx:06d}.wav"
+        pause_after, pause_reason = infer_pause_after(
+            chunk.text,
+            paragraph_end=chunk.paragraph_end,
+            args=args,
+        )
         records.append(
             asdict(
                 ChunkRecord(
                     idx=idx,
-                    text=chunk,
+                    text=chunk.text,
                     wav=str(wav_path),
-                    chars=len(chunk),
+                    chars=len(chunk.text),
+                    pause_after=pause_after,
+                    pause_reason=pause_reason,
+                    paragraph_end=chunk.paragraph_end,
                 )
             )
         )
@@ -213,6 +272,18 @@ def make_manifest(
             "max_chars": args.max_chars,
             "min_chars": args.min_chars,
         },
+        "pause": {
+            "smart_pause": args.smart_pause,
+            "pause_scale": args.pause_scale,
+            "comma_pause": args.comma_pause,
+            "semicolon_pause": args.semicolon_pause,
+            "sentence_pause": args.sentence_pause,
+            "question_pause": args.question_pause,
+            "ellipsis_pause": args.ellipsis_pause,
+            "paragraph_pause": args.paragraph_pause,
+            "default_pause": args.default_pause,
+            "fallback_silence_between_chunks": args.silence_between_chunks,
+        },
         "chunks": records,
         "summary": {
             "total_chunks": len(records),
@@ -225,6 +296,43 @@ def make_manifest(
     }
 
 
+def ensure_pause_fields(manifest: Dict[str, Any], args: argparse.Namespace) -> bool:
+    """Backfill pause metadata for manifests created by older versions."""
+    changed = False
+    chunks = manifest.get("chunks", [])
+    for record in chunks:
+        if "paragraph_end" not in record:
+            record["paragraph_end"] = False
+            changed = True
+        if "pause_after" not in record or "pause_reason" not in record:
+            pause_after, pause_reason = infer_pause_after(
+                record.get("text", ""),
+                paragraph_end=bool(record.get("paragraph_end", False)),
+                args=args,
+            )
+            record["pause_after"] = pause_after
+            record["pause_reason"] = pause_reason
+            changed = True
+
+    pause_cfg = manifest.setdefault("pause", {})
+    for key, value in {
+        "smart_pause": args.smart_pause,
+        "pause_scale": args.pause_scale,
+        "comma_pause": args.comma_pause,
+        "semicolon_pause": args.semicolon_pause,
+        "sentence_pause": args.sentence_pause,
+        "question_pause": args.question_pause,
+        "ellipsis_pause": args.ellipsis_pause,
+        "paragraph_pause": args.paragraph_pause,
+        "default_pause": args.default_pause,
+        "fallback_silence_between_chunks": args.silence_between_chunks,
+    }.items():
+        if key not in pause_cfg:
+            pause_cfg[key] = value
+            changed = True
+    return changed
+
+
 def load_or_create_manifest(args: argparse.Namespace) -> Dict[str, Any]:
     work_dir = Path(args.work_dir)
     chunks_dir = work_dir / "chunks"
@@ -235,6 +343,7 @@ def load_or_create_manifest(args: argparse.Namespace) -> Dict[str, Any]:
         logger.info("Loading existing manifest: %s", manifest_path)
         with manifest_path.open("r", encoding="utf-8") as f:
             manifest = json.load(f)
+        manifest_changed = ensure_pause_fields(manifest, args)
         if args.force:
             for record in manifest["chunks"]:
                 record["status"] = "pending"
@@ -242,6 +351,9 @@ def load_or_create_manifest(args: argparse.Namespace) -> Dict[str, Any]:
                 record["elapsed"] = None
                 record["error"] = None
                 record["updated_at"] = utc_now()
+            update_manifest_summary(manifest)
+            atomic_write_json(manifest_path, manifest)
+        elif manifest_changed:
             update_manifest_summary(manifest)
             atomic_write_json(manifest_path, manifest)
         return manifest
@@ -413,7 +525,7 @@ def render_chunks(
     return manifest
 
 
-def iter_done_chunk_paths(manifest: Dict[str, Any]) -> Iterable[Path]:
+def iter_done_chunk_records(manifest: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
     for record in sorted(manifest["chunks"], key=lambda x: int(x["idx"])):
         if record.get("status") != "done":
             raise RuntimeError(
@@ -422,23 +534,22 @@ def iter_done_chunk_paths(manifest: Dict[str, Any]) -> Iterable[Path]:
         wav_path = Path(record["wav"])
         if not wav_path.exists():
             raise FileNotFoundError(f"Missing chunk wav: {wav_path}")
-        yield wav_path
+        yield record
 
 
 def merge_wav_python(
-    chunk_paths: List[Path],
+    chunk_records: List[Dict[str, Any]],
     output_path: Path,
-    silence_between_chunks: float,
     subtype: str = "PCM_16",
-) -> None:
-    if not chunk_paths:
+) -> float:
+    if not chunk_records:
         raise ValueError("No chunks to merge.")
 
-    first_info = sf.info(str(chunk_paths[0]))
+    first_path = Path(chunk_records[0]["wav"])
+    first_info = sf.info(str(first_path))
     samplerate = first_info.samplerate
     channels = first_info.channels
-    silence_frames = int(max(0.0, silence_between_chunks) * samplerate)
-    silence = np.zeros((silence_frames, channels), dtype=np.float32)
+    total_inserted_pause = 0.0
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
@@ -451,7 +562,8 @@ def merge_wav_python(
         subtype=subtype,
         format="WAV",
     ) as out_f:
-        for i, path in enumerate(chunk_paths):
+        for i, record in enumerate(chunk_records):
+            path = Path(record["wav"])
             info = sf.info(str(path))
             if info.samplerate != samplerate:
                 raise ValueError(
@@ -463,10 +575,16 @@ def merge_wav_python(
                     if block.size == 0:
                         break
                     out_f.write(block)
-            if silence_frames > 0 and i != len(chunk_paths) - 1:
-                out_f.write(silence)
+            if i != len(chunk_records) - 1:
+                pause = max(0.0, float(record.get("pause_after") or 0.0))
+                silence_frames = int(pause * samplerate)
+                if silence_frames > 0:
+                    silence = np.zeros((silence_frames, channels), dtype=np.float32)
+                    out_f.write(silence)
+                    total_inserted_pause += silence_frames / samplerate
 
     os.replace(tmp_path, output_path)
+    return total_inserted_pause
 
 
 def convert_with_ffmpeg(input_wav: Path, output_path: Path, audio_bitrate: str) -> None:
@@ -490,23 +608,21 @@ def convert_with_ffmpeg(input_wav: Path, output_path: Path, audio_bitrate: str) 
 
 def merge_final_audio(args: argparse.Namespace, manifest: Dict[str, Any]) -> None:
     output_path = Path(args.output)
-    chunk_paths = list(iter_done_chunk_paths(manifest))
+    chunk_records = list(iter_done_chunk_records(manifest))
 
-    logger.info("Merging %d chunks -> %s", len(chunk_paths), output_path)
+    logger.info("Merging %d chunks -> %s", len(chunk_records), output_path)
 
     if output_path.suffix.lower() == ".wav":
-        merge_wav_python(
-            chunk_paths,
+        inserted_pause = merge_wav_python(
+            chunk_records,
             output_path,
-            silence_between_chunks=args.silence_between_chunks,
             subtype=args.wav_subtype,
         )
     else:
         tmp_wav = output_path.with_suffix(".merge_tmp.wav")
-        merge_wav_python(
-            chunk_paths,
+        inserted_pause = merge_wav_python(
+            chunk_records,
             tmp_wav,
-            silence_between_chunks=args.silence_between_chunks,
             subtype=args.wav_subtype,
         )
         try:
@@ -518,6 +634,7 @@ def merge_final_audio(args: argparse.Namespace, manifest: Dict[str, Any]) -> Non
     manifest["summary"]["final_status"] = "merged"
     manifest["summary"]["final_output"] = str(output_path.resolve())
     manifest["summary"]["final_size_bytes"] = output_path.stat().st_size
+    manifest["summary"]["inserted_pause_duration"] = inserted_pause
     manifest["updated_at"] = utc_now()
 
 
@@ -571,7 +688,66 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rebuild_manifest", type=str2bool, default=False)
     parser.add_argument("--continue_on_error", type=str2bool, default=False)
     parser.add_argument("--merge", type=str2bool, default=True)
-    parser.add_argument("--silence_between_chunks", type=float, default=0.2)
+    parser.add_argument(
+        "--smart_pause",
+        type=str2bool,
+        default=True,
+        help="Insert different pauses after chunks based on ending punctuation.",
+    )
+    parser.add_argument(
+        "--pause_scale",
+        type=float,
+        default=1.0,
+        help="Multiply all smart pause durations by this factor.",
+    )
+    parser.add_argument(
+        "--comma_pause",
+        type=float,
+        default=0.18,
+        help="Pause after comma-like punctuation, in seconds.",
+    )
+    parser.add_argument(
+        "--semicolon_pause",
+        type=float,
+        default=0.28,
+        help="Pause after semicolon/colon punctuation, in seconds.",
+    )
+    parser.add_argument(
+        "--sentence_pause",
+        type=float,
+        default=0.45,
+        help="Pause after sentence-ending period punctuation, in seconds.",
+    )
+    parser.add_argument(
+        "--question_pause",
+        type=float,
+        default=0.52,
+        help="Pause after question/exclamation punctuation, in seconds.",
+    )
+    parser.add_argument(
+        "--ellipsis_pause",
+        type=float,
+        default=0.65,
+        help="Pause after ellipsis punctuation, in seconds.",
+    )
+    parser.add_argument(
+        "--paragraph_pause",
+        type=float,
+        default=0.75,
+        help="Minimum pause after paragraph-ending chunks, in seconds.",
+    )
+    parser.add_argument(
+        "--default_pause",
+        type=float,
+        default=0.25,
+        help="Pause after chunks without recognizable ending punctuation, in seconds.",
+    )
+    parser.add_argument(
+        "--silence_between_chunks",
+        type=float,
+        default=0.2,
+        help="Fallback fixed pause when --smart_pause false, in seconds.",
+    )
     parser.add_argument("--wav_subtype", default="PCM_16")
     parser.add_argument("--audio_bitrate", default="192k")
 

@@ -8,4 +8,7 @@ soundfile
 librosa
 numpy
 gradio
+fastapi
+uvicorn[standard]
+python-multipart
 hf_transfer

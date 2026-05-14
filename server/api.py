@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""FastAPI backend for OmniVoice React web UI.
+
+This backend intentionally separates two paths:
+
+- Short interactive TTS: handled in-process with one lazily-loaded model.
+- Long text jobs: submitted as background subprocesses that run
+  ``python -m omnivoice.cli.long_text`` and write resumable manifests.
+
+Run:
+    python -m uvicorn server.api:app --host 127.0.0.1 --port 8000
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import soundfile as sf
+import torch
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+
+from omnivoice import OmniVoice, OmniVoiceGenerationConfig
+from omnivoice.utils.common import str2bool
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+JOBS_DIR = ROOT_DIR / "jobs"
+SHORT_DIR = ROOT_DIR / "outputs" / "short"
+DEFAULT_MODEL = os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice")
+DEFAULT_DEVICE = os.environ.get("OMNIVOICE_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+DEFAULT_DTYPE = os.environ.get("OMNIVOICE_DTYPE", "auto")
+
+JOBS_DIR.mkdir(parents=True, exist_ok=True)
+SHORT_DIR.mkdir(parents=True, exist_ok=True)
+
+app = FastAPI(title="OmniVoice API", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.environ.get("OMNIVOICE_CORS_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+_model: Optional[OmniVoice] = None
+_sampling_rate: Optional[int] = None
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def resolve_dtype(dtype_name: str, device: str) -> torch.dtype:
+    if dtype_name == "auto":
+        return torch.float16 if str(device).startswith("cuda") else torch.float32
+    if dtype_name == "float16":
+        return torch.float16
+    if dtype_name == "bfloat16":
+        return torch.bfloat16
+    if dtype_name == "float32":
+        return torch.float32
+    raise ValueError(f"Unsupported dtype: {dtype_name}")
+
+
+def get_model() -> OmniVoice:
+    global _model, _sampling_rate
+    if _model is None:
+        dtype = resolve_dtype(DEFAULT_DTYPE, DEFAULT_DEVICE)
+        _model = OmniVoice.from_pretrained(
+            DEFAULT_MODEL,
+            device_map=DEFAULT_DEVICE,
+            dtype=dtype,
+            load_asr=False,
+        )
+        _model.eval()
+        _sampling_rate = _model.sampling_rate
+    return _model
+
+
+def write_json(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def read_json(path: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+async def save_upload(upload: Optional[UploadFile], path: Path) -> Optional[Path]:
+    if upload is None or not upload.filename:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as f:
+        while True:
+            chunk = await upload.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+    return path
+
+
+def job_dir(job_id: str) -> Path:
+    safe = "".join(c for c in job_id if c.isalnum() or c in "-_")
+    return JOBS_DIR / safe
+
+
+def job_meta_path(job_id: str) -> Path:
+    return job_dir(job_id) / "job.json"
+
+
+def manifest_path(job_id: str) -> Path:
+    return job_dir(job_id) / "work" / "manifest.json"
+
+
+def read_job(job_id: str) -> Dict[str, Any]:
+    path = job_meta_path(job_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Job not found")
+    meta = read_json(path)
+    mpath = manifest_path(job_id)
+    if mpath.exists():
+        try:
+            meta["manifest"] = read_json(mpath)
+        except Exception as exc:  # noqa: BLE001
+            meta["manifest_error"] = str(exc)
+    output = Path(meta.get("output", ""))
+    meta["output_exists"] = bool(output.exists())
+    meta["log_exists"] = bool((job_dir(job_id) / "worker.log").exists())
+    return meta
+
+
+def is_pid_running(pid: Optional[int]) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def refresh_job_status(meta: Dict[str, Any]) -> Dict[str, Any]:
+    status = meta.get("status")
+    pid = meta.get("pid")
+    if status == "running" and not is_pid_running(pid):
+        output = Path(meta.get("output", ""))
+        if output.exists():
+            meta["status"] = "done"
+        else:
+            meta["status"] = "stopped"
+        meta["updated_at"] = utc_now()
+        write_json(job_meta_path(meta["id"]), meta)
+    return meta
+
+
+@app.get("/api/health")
+def health() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "model": DEFAULT_MODEL,
+        "device": DEFAULT_DEVICE,
+        "dtype": DEFAULT_DTYPE,
+        "cuda": torch.cuda.is_available(),
+        "model_loaded": _model is not None,
+    }
+
+
+@app.get("/api/config")
+def config() -> Dict[str, Any]:
+    return {
+        "defaultModel": DEFAULT_MODEL,
+        "defaultDevice": DEFAULT_DEVICE,
+        "shortOutputDir": str(SHORT_DIR),
+        "jobsDir": str(JOBS_DIR),
+    }
+
+
+@app.post("/api/tts/short")
+async def short_tts(
+    text: str = Form(...),
+    language: Optional[str] = Form(None),
+    mode: str = Form("auto"),
+    ref_audio: Optional[UploadFile] = File(None),
+    ref_text: Optional[str] = Form(None),
+    instruct: Optional[str] = Form(None),
+    num_step: int = Form(16),
+    guidance_scale: float = Form(2.0),
+    speed: float = Form(1.0),
+    duration: Optional[float] = Form(None),
+    denoise: bool = Form(True),
+    preprocess_prompt: bool = Form(True),
+    postprocess_output: bool = Form(True),
+) -> FileResponse:
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Text is required")
+
+    model = get_model()
+    request_id = uuid.uuid4().hex
+    request_dir = SHORT_DIR / request_id
+    request_dir.mkdir(parents=True, exist_ok=True)
+
+    ref_path = await save_upload(ref_audio, request_dir / "reference.wav")
+    gen_config = OmniVoiceGenerationConfig(
+        num_step=num_step,
+        guidance_scale=guidance_scale,
+        denoise=denoise,
+        preprocess_prompt=preprocess_prompt,
+        postprocess_output=postprocess_output,
+    )
+
+    kwargs: Dict[str, Any] = {
+        "text": text.strip(),
+        "language": language if language and language != "Auto" else None,
+        "generation_config": gen_config,
+    }
+    if speed and speed != 1.0:
+        kwargs["speed"] = speed
+    if duration and duration > 0:
+        kwargs["duration"] = duration
+
+    if mode == "clone":
+        if ref_path is None:
+            raise HTTPException(status_code=400, detail="Reference audio is required for clone mode")
+        kwargs["voice_clone_prompt"] = model.create_voice_clone_prompt(
+            ref_audio=str(ref_path),
+            ref_text=ref_text or None,
+            preprocess_prompt=preprocess_prompt,
+        )
+    elif mode == "design" and instruct:
+        kwargs["instruct"] = instruct.strip()
+
+    with torch.inference_mode():
+        audio = model.generate(**kwargs)[0]
+
+    output_path = request_dir / "output.wav"
+    sf.write(str(output_path), audio, model.sampling_rate)
+    return FileResponse(str(output_path), media_type="audio/wav", filename="omnivoice.wav")
+
+
+@app.post("/api/jobs/long")
+async def create_long_job(
+    background_tasks: BackgroundTasks,
+    script_text: Optional[str] = Form(None),
+    script_file: Optional[UploadFile] = File(None),
+    ref_audio: Optional[UploadFile] = File(None),
+    ref_text: Optional[str] = Form(None),
+    language: Optional[str] = Form(None),
+    model: str = Form(DEFAULT_MODEL),
+    output_format: str = Form("wav"),
+    num_step: int = Form(16),
+    max_chars: int = Form(1200),
+    min_chars: int = Form(120),
+    guidance_scale: float = Form(2.0),
+    speed: float = Form(1.0),
+    smart_pause: bool = Form(True),
+    pause_scale: float = Form(1.0),
+    comma_pause: float = Form(0.18),
+    sentence_pause: float = Form(0.45),
+    paragraph_pause: float = Form(0.75),
+    postprocess_output: bool = Form(True),
+) -> Dict[str, Any]:
+    if not script_text and (script_file is None or not script_file.filename):
+        raise HTTPException(status_code=400, detail="script_text or script_file is required")
+
+    job_id = uuid.uuid4().hex[:12]
+    jdir = job_dir(job_id)
+    jdir.mkdir(parents=True, exist_ok=True)
+
+    script_path = jdir / "script.txt"
+    if script_file and script_file.filename:
+        await save_upload(script_file, script_path)
+    else:
+        script_path.write_text(script_text or "", encoding="utf-8")
+
+    ref_path = await save_upload(ref_audio, jdir / "reference.wav")
+    output_ext = "mp3" if output_format.lower() == "mp3" else "wav"
+    output_path = jdir / f"final.{output_ext}"
+    work_dir = jdir / "work"
+    log_path = jdir / "worker.log"
+
+    cmd: List[str] = [
+        sys.executable,
+        "-m",
+        "omnivoice.cli.long_text",
+        "--model",
+        model,
+        "--input",
+        str(script_path),
+        "--output",
+        str(output_path),
+        "--work_dir",
+        str(work_dir),
+        "--num_step",
+        str(num_step),
+        "--max_chars",
+        str(max_chars),
+        "--min_chars",
+        str(min_chars),
+        "--guidance_scale",
+        str(guidance_scale),
+        "--speed",
+        str(speed),
+        "--smart_pause",
+        str(smart_pause).lower(),
+        "--pause_scale",
+        str(pause_scale),
+        "--comma_pause",
+        str(comma_pause),
+        "--sentence_pause",
+        str(sentence_pause),
+        "--paragraph_pause",
+        str(paragraph_pause),
+        "--postprocess_output",
+        str(postprocess_output).lower(),
+        "--device",
+        DEFAULT_DEVICE,
+        "--dtype",
+        DEFAULT_DTYPE,
+        "--resume",
+        "true",
+    ]
+    if language:
+        cmd += ["--language", language]
+    if ref_path is not None:
+        cmd += ["--ref_audio", str(ref_path)]
+    if ref_text:
+        cmd += ["--ref_text", ref_text]
+
+    log_file = log_path.open("ab")
+    process = subprocess.Popen(
+        cmd,
+        cwd=str(ROOT_DIR),
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        start_new_session=os.name != "nt",
+    )
+    background_tasks.add_task(log_file.close)
+
+    meta = {
+        "id": job_id,
+        "status": "running",
+        "pid": process.pid,
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+        "script": str(script_path),
+        "reference": str(ref_path) if ref_path else None,
+        "output": str(output_path),
+        "work_dir": str(work_dir),
+        "log": str(log_path),
+        "command": cmd,
+    }
+    write_json(job_meta_path(job_id), meta)
+    return read_job(job_id)
+
+
+@app.get("/api/jobs")
+def list_jobs() -> Dict[str, Any]:
+    jobs: List[Dict[str, Any]] = []
+    for path in sorted(JOBS_DIR.glob("*/job.json"), reverse=True):
+        try:
+            meta = refresh_job_status(read_json(path))
+            jobs.append(read_job(meta["id"]))
+        except Exception:  # noqa: BLE001
+            continue
+    return {"jobs": jobs}
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str) -> Dict[str, Any]:
+    return refresh_job_status(read_job(job_id))
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str) -> Dict[str, Any]:
+    meta = read_job(job_id)
+    pid = meta.get("pid")
+    if pid and is_pid_running(pid):
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], check=False)
+        else:
+            os.killpg(pid, signal.SIGTERM)
+    meta["status"] = "cancelled"
+    meta["updated_at"] = utc_now()
+    write_json(job_meta_path(job_id), meta)
+    return read_job(job_id)
+
+
+@app.get("/api/jobs/{job_id}/download")
+def download_job(job_id: str) -> FileResponse:
+    meta = read_job(job_id)
+    output = Path(meta.get("output", ""))
+    if not output.exists():
+        raise HTTPException(status_code=404, detail="Output file is not ready")
+    media = "audio/mpeg" if output.suffix.lower() == ".mp3" else "audio/wav"
+    return FileResponse(str(output), media_type=media, filename=output.name)
+
+
+@app.get("/api/jobs/{job_id}/log")
+def download_log(job_id: str) -> FileResponse:
+    meta = read_job(job_id)
+    log_path = Path(meta.get("log", ""))
+    if not log_path.exists():
+        raise HTTPException(status_code=404, detail="Log file not found")
+    return FileResponse(str(log_path), media_type="text/plain", filename="worker.log")
