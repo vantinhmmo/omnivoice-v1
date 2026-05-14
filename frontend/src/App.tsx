@@ -1,11 +1,98 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
-import { cancelJob, createLongJob, downloadUrl, getHealth, listJobs, logUrl, shortTts } from './api';
+import { ChangeEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { cancelJob, createLongJob, downloadUrl, getHealth, listJobs, logUrl } from './api';
 import type { Health, LongJob } from './types';
 
-type Tab = 'short' | 'long' | 'jobs';
+type QueueRow = {
+  id: string;
+  text: string;
+  chars: number;
+  status: string;
+  pause?: number;
+  duration?: number;
+};
 
-function pct(job: LongJob): number {
-  const summary = job.manifest?.summary;
+type SettingsState = Record<string, string | boolean>;
+
+type VoicePreset = {
+  id: string;
+  name: string;
+  settings: SettingsState;
+  createdAt: string;
+};
+
+type ToastState = { message: string; type: 'ok' | 'error' } | null;
+
+const SETTINGS_LS_KEY = 'omnivoice.longtext.settings.v1';
+const VOICE_PRESETS_LS_KEY = 'omnivoice.longtext.voice-presets.v1';
+
+const DEFAULT_SETTINGS: SettingsState = {
+  model: 'k2-fsa/OmniVoice',
+  language: 'vi',
+  output_format: 'wav',
+  ref_text: '',
+  num_step: '32',
+  max_chars: '1200',
+  min_chars: '120',
+  guidance_scale: '2.0',
+  speed: '1.0',
+  pause_scale: '1.0',
+  comma_pause: '0.18',
+  sentence_pause: '0.45',
+  paragraph_pause: '0.75',
+  smart_pause: true,
+  postprocess_output: true,
+};
+
+const PRIMARY_LANGUAGES = ['Auto', 'Vietnamese', 'English', 'Thai', 'Japanese', 'Spanish', 'Indonesian', 'French'] as const;
+
+function normalizeLanguageValue(value: unknown): string {
+  const raw = String(value ?? '').trim();
+  if (!raw) return 'Auto';
+
+  const lower = raw.toLowerCase();
+  const codeMap: Record<string, string> = {
+    auto: 'Auto',
+    vi: 'Vietnamese',
+    en: 'English',
+    th: 'Thai',
+    ja: 'Japanese',
+    es: 'Spanish',
+    id: 'Indonesian',
+    fr: 'French',
+  };
+
+  if (codeMap[lower]) return codeMap[lower];
+  const exact = PRIMARY_LANGUAGES.find((name) => name.toLowerCase() === lower);
+  return exact ?? raw;
+}
+
+function safeLoadSettings(): SettingsState {
+  try {
+    const raw = localStorage.getItem(SETTINGS_LS_KEY);
+    const parsed = raw ? (JSON.parse(raw) as Partial<SettingsState>) : {};
+    const merged = { ...DEFAULT_SETTINGS, ...parsed } as SettingsState;
+    merged.language = normalizeLanguageValue(merged.language);
+    return merged;
+  } catch {
+    const fallback = { ...DEFAULT_SETTINGS } as SettingsState;
+    fallback.language = normalizeLanguageValue(fallback.language);
+    return fallback;
+  }
+}
+
+function safeLoadPresets(): VoicePreset[] {
+  try {
+    const raw = localStorage.getItem(VOICE_PRESETS_LS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as VoicePreset[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function pct(job?: LongJob | null): number {
+  const summary = job?.manifest?.summary;
   const total = summary?.total_chunks ?? 0;
   const done = summary?.completed_chunks ?? 0;
   return total > 0 ? Math.round((done / total) * 100) : 0;
@@ -19,271 +106,280 @@ function fmtSeconds(v?: number | null): string {
   return [h ? `${h}h` : '', m ? `${m}m` : '', `${s}s`].filter(Boolean).join(' ');
 }
 
+function splitPreview(text: string, maxChars: number): QueueRow[] {
+  const normalized = text.replace(/\r\n/g, '\n').trim();
+  if (!normalized) return [];
+  const parts = normalized
+    .split(/(?<=[,.!?;:。！？；：，])\s+|\n\s*\n/g)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  const rows: string[] = [];
+  let current = '';
+
+  for (const part of parts) {
+    if (!current) current = part;
+    else if ((current + ' ' + part).length <= maxChars) current += ` ${part}`;
+    else {
+      rows.push(current);
+      current = part;
+    }
+  }
+
+  if (current) rows.push(current);
+
+  return rows.map((chunkText, idx) => ({
+    id: `draft-${idx}`,
+    text: chunkText,
+    chars: chunkText.length,
+    status: 'queued',
+  }));
+}
+
+function jobRows(job?: LongJob | null): QueueRow[] {
+  return (job?.manifest?.chunks ?? []).map((chunk) => ({
+    id: String(chunk.idx),
+    text: chunk.text,
+    chars: chunk.chars,
+    status: chunk.status,
+    pause: chunk.pause_after,
+    duration: chunk.duration,
+  }));
+}
+
+function statusLabel(status: string): string {
+  const map: Record<string, string> = {
+    queued: 'Chờ',
+    pending: 'Chờ',
+    running: 'Đang chạy',
+    done: 'Xong',
+    failed: 'Lỗi',
+    cancelled: 'Đã hủy',
+    stopped: 'Dừng',
+    merged: 'Đã ghép',
+  };
+  return map[status] ?? status;
+}
+
 function StatusPill({ status }: { status: string }) {
-  return <span className={`pill pill-${status}`}>{status}</span>;
+  return <span className={`pill pill-${status}`}>{statusLabel(status)}</span>;
 }
 
-function Header({ health }: { health: Health | null }) {
-  return (
-    <header className="hero">
-      <div>
-        <p className="eyebrow">OmniVoice Studio</p>
-        <h1>Voice cloning & long-form narration</h1>
-        <p className="subtitle">
-          UI React/Vite cho generate ngắn, render long text theo job queue, theo dõi progress và download file cuối.
-        </p>
-      </div>
-      <div className="health-card">
-        <span className={health?.ok ? 'dot ok' : 'dot'} />
-        <div>
-          <b>{health?.ok ? 'API online' : 'API offline'}</b>
-          <small>{health ? `${health.device} · ${health.dtype} · ${health.model}` : 'Chưa kết nối backend'}</small>
-        </div>
-      </div>
-    </header>
-  );
-}
-
-function Tabs({ active, onChange }: { active: Tab; onChange: (t: Tab) => void }) {
-  return (
-    <nav className="tabs">
-      <button className={active === 'short' ? 'active' : ''} onClick={() => onChange('short')}>Generate ngắn</button>
-      <button className={active === 'long' ? 'active' : ''} onClick={() => onChange('long')}>Long text job</button>
-      <button className={active === 'jobs' ? 'active' : ''} onClick={() => onChange('jobs')}>Jobs / Progress</button>
-    </nav>
-  );
-}
-
-function ShortTtsPanel() {
-  const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState('Sẵn sàng');
-  const [audioUrl, setAudioUrl] = useState<string | null>(null);
-  const [mode, setMode] = useState('clone');
-  const refAudioRef = useRef<HTMLInputElement | null>(null);
-
-  async function submit(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    setBusy(true);
-    setStatus('Đang generate...');
-    setAudioUrl(null);
-    try {
-      const form = new FormData(e.currentTarget);
-      form.set('mode', mode);
-      const refFile = refAudioRef.current?.files?.[0];
-      if (refFile) form.set('ref_audio', refFile);
-      const blob = await shortTts(form);
-      setAudioUrl(URL.createObjectURL(blob));
-      setStatus('Hoàn tất');
-    } catch (err) {
-      setStatus(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <form className="panel grid" onSubmit={submit}>
-      <section className="card span-2">
-        <h2>Generate audio ngắn</h2>
-        <label>Text cần đọc</label>
-        <textarea name="text" required rows={7} placeholder="Nhập nội dung cần chuyển thành giọng nói..." />
-        <div className="row">
-          <label>
-            Mode
-            <select value={mode} onChange={(e) => setMode(e.target.value)}>
-              <option value="clone">Clone voice</option>
-              <option value="design">Voice design</option>
-              <option value="auto">Auto voice</option>
-            </select>
-          </label>
-          <label>
-            Language
-            <input name="language" placeholder="vi, en, Auto..." />
-          </label>
-        </div>
-      </section>
-
-      <section className="card">
-        <h3>Voice</h3>
-        <label>Reference audio</label>
-        <input ref={refAudioRef} type="file" accept="audio/*" />
-        <label>Reference text</label>
-        <textarea name="ref_text" rows={3} placeholder="Transcript của reference audio để tránh ASR" />
-        <label>Voice design instruct</label>
-        <input name="instruct" placeholder="male, British accent" />
-      </section>
-
-      <section className="card">
-        <h3>Settings</h3>
-        <div className="row compact">
-          <label>Steps<input name="num_step" type="number" defaultValue={16} min={4} max={64} /></label>
-          <label>CFG<input name="guidance_scale" type="number" defaultValue={2.0} step={0.1} /></label>
-        </div>
-        <div className="row compact">
-          <label>Speed<input name="speed" type="number" defaultValue={1.0} step={0.05} /></label>
-          <label>Duration<input name="duration" type="number" step={0.1} placeholder="optional" /></label>
-        </div>
-        <label className="check"><input name="denoise" type="checkbox" defaultChecked /> Denoise</label>
-        <label className="check"><input name="preprocess_prompt" type="checkbox" defaultChecked /> Preprocess prompt</label>
-        <label className="check"><input name="postprocess_output" type="checkbox" defaultChecked /> Postprocess output</label>
-        <button disabled={busy} className="primary">{busy ? 'Đang chạy...' : 'Generate'}</button>
-      </section>
-
-      <section className="card span-2">
-        <h3>Kết quả</h3>
-        <p className="status-text">{status}</p>
-        {audioUrl && <audio controls src={audioUrl} className="audio" />}
-      </section>
-    </form>
-  );
-}
-
-function LongJobPanel({ onCreated }: { onCreated: () => void }) {
-  const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState('Sẵn sàng');
-  const scriptFileRef = useRef<HTMLInputElement | null>(null);
-  const refAudioRef = useRef<HTMLInputElement | null>(null);
-
-  async function submit(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    setBusy(true);
-    setStatus('Đang tạo job...');
-    try {
-      const form = new FormData(e.currentTarget);
-      const scriptFile = scriptFileRef.current?.files?.[0];
-      const refFile = refAudioRef.current?.files?.[0];
-      if (scriptFile) form.set('script_file', scriptFile);
-      if (refFile) form.set('ref_audio', refFile);
-      const job = await createLongJob(form);
-      setStatus(`Đã tạo job ${job.id}`);
-      onCreated();
-    } catch (err) {
-      setStatus(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <form className="panel grid" onSubmit={submit}>
-      <section className="card span-2">
-        <h2>Render long text 2-3 giờ</h2>
-        <label>Script text</label>
-        <textarea name="script_text" rows={10} placeholder="Dán script dài ở đây hoặc upload file .txt bên dưới..." />
-        <label>Hoặc upload .txt</label>
-        <input ref={scriptFileRef} type="file" accept=".txt,text/plain" />
-      </section>
-
-      <section className="card">
-        <h3>Voice clone</h3>
-        <label>Reference audio 5-15s</label>
-        <input ref={refAudioRef} type="file" accept="audio/*" />
-        <label>Reference text</label>
-        <textarea name="ref_text" rows={4} placeholder="Nên nhập đúng transcript reference audio" />
-        <label>Language</label>
-        <input name="language" placeholder="vi" defaultValue="vi" />
-        <label>Output</label>
-        <select name="output_format" defaultValue="wav">
-          <option value="wav">WAV</option>
-          <option value="mp3">MP3</option>
-        </select>
-      </section>
-
-      <section className="card">
-        <h3>Render settings</h3>
-        <div className="row compact">
-          <label>Steps<input name="num_step" type="number" defaultValue={16} min={4} max={64} /></label>
-          <label>Max chars<input name="max_chars" type="number" defaultValue={1200} /></label>
-        </div>
-        <div className="row compact">
-          <label>Min chars<input name="min_chars" type="number" defaultValue={120} /></label>
-          <label>CFG<input name="guidance_scale" type="number" defaultValue={2.0} step={0.1} /></label>
-        </div>
-        <div className="row compact">
-          <label>Speed<input name="speed" type="number" defaultValue={1.0} step={0.05} /></label>
-          <label>Pause scale<input name="pause_scale" type="number" defaultValue={1.0} step={0.05} /></label>
-        </div>
-        <label className="check"><input name="smart_pause" type="checkbox" defaultChecked /> Smart pause theo dấu câu</label>
-        <label className="check"><input name="postprocess_output" type="checkbox" defaultChecked /> Postprocess output</label>
-        <details>
-          <summary>Pause nâng cao</summary>
-          <div className="row compact">
-            <label>Dấu phẩy<input name="comma_pause" type="number" defaultValue={0.18} step={0.01} /></label>
-            <label>Dấu chấm<input name="sentence_pause" type="number" defaultValue={0.45} step={0.01} /></label>
-          </div>
-          <label>Đoạn văn<input name="paragraph_pause" type="number" defaultValue={0.75} step={0.01} /></label>
-        </details>
-        <button disabled={busy} className="primary">{busy ? 'Đang tạo...' : 'Submit long job'}</button>
-        <p className="status-text">{status}</p>
-      </section>
-    </form>
-  );
-}
-
-function JobCard({ job, onRefresh }: { job: LongJob; onRefresh: () => void }) {
-  const summary = job.manifest?.summary;
-  const progress = pct(job);
-  const chunks = job.manifest?.chunks ?? [];
-  const latest = [...chunks].reverse().find((c) => c.status === 'done' || c.status === 'failed' || c.status === 'running');
-
-  async function onCancel() {
-    await cancelJob(job.id);
-    onRefresh();
-  }
-
-  return (
-    <article className="job-card">
-      <div className="job-head">
-        <div>
-          <h3>Job {job.id}</h3>
-          <small>{new Date(job.created_at).toLocaleString()}</small>
-        </div>
-        <StatusPill status={job.status} />
-      </div>
-      <div className="progress"><span style={{ width: `${progress}%` }} /></div>
-      <div className="job-metrics">
-        <span>{summary?.completed_chunks ?? 0}/{summary?.total_chunks ?? 0} chunks</span>
-        <span>{progress}%</span>
-        <span>Audio {fmtSeconds(summary?.total_audio_duration)}</span>
-        <span>Elapsed {fmtSeconds(summary?.total_elapsed)}</span>
-        <span>Pause {fmtSeconds(summary?.inserted_pause_duration)}</span>
-        <span>RTF {summary?.average_rtf ? summary.average_rtf.toFixed(2) : '-'}</span>
-      </div>
-      {latest && <p className="latest">Chunk gần nhất: #{latest.idx} · {latest.status} · pause {latest.pause_after ?? 0}s ({latest.pause_reason ?? 'n/a'})</p>}
-      <div className="actions">
-        <button onClick={onRefresh}>Refresh</button>
-        {job.status === 'running' && <button className="danger" onClick={onCancel}>Cancel</button>}
-        {job.output_exists && <a className="button" href={downloadUrl(job.id)}>Download</a>}
-        {job.log_exists && <a className="button ghost" href={logUrl(job.id)} target="_blank">Log</a>}
-      </div>
-    </article>
-  );
-}
-
-function JobsPanel({ jobs, refresh }: { jobs: LongJob[]; refresh: () => void }) {
-  return (
-    <section className="panel">
-      <div className="panel-head">
-        <h2>Jobs / Progress</h2>
-        <button onClick={refresh}>Refresh</button>
-      </div>
-      {jobs.length === 0 ? <p className="muted">Chưa có job nào.</p> : <div className="jobs">{jobs.map((j) => <JobCard key={j.id} job={j} onRefresh={refresh} />)}</div>}
-    </section>
-  );
+function Toast({ toast }: { toast: ToastState }) {
+  if (!toast) return null;
+  return <div className={`toast toast-${toast.type}`}>{toast.message}</div>;
 }
 
 export default function App() {
-  const [tab, setTab] = useState<Tab>('short');
   const [health, setHealth] = useState<Health | null>(null);
   const [jobs, setJobs] = useState<LongJob[]>([]);
+  const [scriptText, setScriptText] = useState('');
+  const [scriptFileName, setScriptFileName] = useState('');
+  const [textModalOpen, setTextModalOpen] = useState(false);
+  const [modalDraft, setModalDraft] = useState('');
+  const [viewMode, setViewMode] = useState<'draft' | 'job'>('draft');
+  const [busy, setBusy] = useState(false);
+  const [submitUiLocked, setSubmitUiLocked] = useState(false);
+  const refAudioRef = useRef<HTMLInputElement | null>(null);
+  const submitLockRef = useRef(false);
+  const [refAudioPreviewUrl, setRefAudioPreviewUrl] = useState('');
+
+  const [settings, setSettingsState] = useState<SettingsState>(() => safeLoadSettings());
+  const [voicePresets, setVoicePresets] = useState<VoicePreset[]>(() => safeLoadPresets());
+  const [selectedPresetId, setSelectedPresetId] = useState('');
+  const [voiceName, setVoiceName] = useState('');
+  const [toast, setToast] = useState<ToastState>(null);
+
+  const latestJob = jobs[0] ?? null;
+  const draftRows = useMemo(() => splitPreview(scriptText, Number(settings.max_chars) || 1200), [scriptText, settings.max_chars]);
+  const latestJobRows = useMemo(() => (latestJob ? jobRows(latestJob) : []), [latestJob]);
+  const rows = viewMode === 'job' ? (latestJobRows.length ? latestJobRows : draftRows) : draftRows;
   const runningJobs = useMemo(() => jobs.some((j) => j.status === 'running'), [jobs]);
+  const summary = latestJob?.manifest?.summary;
+  const progress = pct(latestJob);
+  const creatingJob = busy;
+  const activeJob = useMemo(
+    () => jobs.find((j) => ['running', 'queued', 'pending'].includes(j.status)) ?? null,
+    [jobs]
+  );
+
+  function flash(message: string, type: 'ok' | 'error' = 'ok') {
+    setToast({ message, type });
+    window.setTimeout(() => setToast(null), 2200);
+  }
+
+  function setSettings(patch: Partial<SettingsState>) {
+    setSettingsState((current) => ({ ...current, ...patch }) as SettingsState);
+  }
+
+  function saveSettings() {
+    try {
+      localStorage.setItem(SETTINGS_LS_KEY, JSON.stringify(settings));
+      flash('Đã lưu cài đặt.', 'ok');
+    } catch {
+      flash('Không lưu được cài đặt.', 'error');
+    }
+  }
+
+  function resetSettings() {
+    setSettingsState({ ...DEFAULT_SETTINGS });
+    flash('Đã đặt lại cài đặt mặc định.', 'ok');
+  }
+
+  function saveVoicePreset() {
+    const name = voiceName.trim();
+    if (!name) {
+      flash('Vui lòng nhập tên giọng trước khi lưu.', 'error');
+      return;
+    }
+    const preset: VoicePreset = {
+      id: crypto.randomUUID(),
+      name,
+      settings: { ...settings },
+      createdAt: new Date().toISOString(),
+    };
+    const next = [preset, ...voicePresets].slice(0, 40);
+    setVoicePresets(next);
+    setSelectedPresetId(preset.id);
+    setVoiceName('');
+    localStorage.setItem(VOICE_PRESETS_LS_KEY, JSON.stringify(next));
+    flash('Đã lưu giọng.', 'ok');
+  }
+
+  function loadVoicePreset() {
+    if (!selectedPresetId) {
+      flash('Hãy chọn một giọng đã lưu.', 'error');
+      return;
+    }
+    const preset = voicePresets.find((p) => p.id === selectedPresetId);
+    if (!preset) {
+      flash('Không tìm thấy giọng đã lưu.', 'error');
+      return;
+    }
+    setSettingsState({ ...DEFAULT_SETTINGS, ...preset.settings } as SettingsState);
+    flash(`Đã nạp giọng: ${preset.name}`, 'ok');
+  }
+
+  function deleteVoicePreset() {
+    if (!selectedPresetId) {
+      flash('Hãy chọn một giọng để xóa.', 'error');
+      return;
+    }
+    const next = voicePresets.filter((p) => p.id !== selectedPresetId);
+    setVoicePresets(next);
+    setSelectedPresetId('');
+    localStorage.setItem(VOICE_PRESETS_LS_KEY, JSON.stringify(next));
+    flash('Đã xóa giọng đã lưu.', 'ok');
+  }
 
   async function refreshJobs() {
     try {
-      setJobs(await listJobs());
+      const next = await listJobs();
+      const one = next.slice(0, 1);
+      setJobs(one);
+      if (!one.length) setViewMode('draft');
     } catch (err) {
       console.error(err);
     }
+  }
+
+  function ensureCanLoadScript(): boolean {
+    if (runningJobs) {
+      flash('Đang có job chạy. Hãy dừng hoặc chờ job xong rồi mới nạp văn bản mới.', 'error');
+      return false;
+    }
+    return true;
+  }
+
+  async function onScriptFile(e: ChangeEvent<HTMLInputElement>) {
+    if (!ensureCanLoadScript()) {
+      e.target.value = '';
+      return;
+    }
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setScriptFileName(file.name);
+    setScriptText(await file.text());
+    setViewMode('draft');
+    flash(`Đã nạp file ${file.name}`, 'ok');
+  }
+
+  function onRefAudioFile(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) {
+      setRefAudioPreviewUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return '';
+      });
+      return;
+    }
+
+    const nextUrl = URL.createObjectURL(file);
+    setRefAudioPreviewUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return nextUrl;
+    });
+    flash(`Đã nạp reference audio: ${file.name}`, 'ok');
+  }
+
+  function openTextModal() {
+    if (!ensureCanLoadScript()) return;
+    setModalDraft(scriptText);
+    setTextModalOpen(true);
+  }
+
+  function applyTextModal() {
+    if (!ensureCanLoadScript()) return;
+    setScriptText(modalDraft);
+    setScriptFileName('Nhập thủ công');
+    setTextModalOpen(false);
+    setViewMode('draft');
+    flash('Đã cập nhật nội dung văn bản.', 'ok');
+  }
+
+  async function submitJob() {
+    if (submitLockRef.current || busy || submitUiLocked) {
+      flash('Yêu cầu tạo job đang được xử lý, vui lòng chờ.', 'error');
+      return;
+    }
+    if (activeJob || runningJobs) {
+      flash('Đang có job hoạt động. Chỉ được chạy 1 job tại 1 thời điểm.', 'error');
+      return;
+    }
+    if (!scriptText.trim()) {
+      openTextModal();
+      return;
+    }
+
+    submitLockRef.current = true;
+    setSubmitUiLocked(true);
+    setBusy(true);
+    try {
+      const form = new FormData();
+      form.set('script_text', scriptText);
+      for (const [key, value] of Object.entries(settings)) {
+        form.set(key, String(value));
+      }
+      const refFile = refAudioRef.current?.files?.[0];
+      if (refFile) form.set('ref_audio', refFile);
+      const job = await createLongJob(form);
+      await refreshJobs();
+      setViewMode('job');
+      flash(`Đã tạo job ${job.id}`, 'ok');
+    } catch (err) {
+      flash(err instanceof Error ? err.message : String(err), 'error');
+    } finally {
+      setBusy(false);
+      submitLockRef.current = false;
+      setSubmitUiLocked(false);
+    }
+  }
+
+  async function stopJob() {
+    if (!latestJob || latestJob.status !== 'running') return;
+    await cancelJob(latestJob.id);
+    refreshJobs();
+    flash(`Đã gửi lệnh dừng job ${latestJob.id}`, 'ok');
   }
 
   useEffect(() => {
@@ -292,20 +388,296 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const intervalMs = runningJobs ? 3000 : latestJob ? 6000 : 12000;
+    const timer = setInterval(() => {
+      if (runningJobs || latestJob) refreshJobs();
+    }, intervalMs);
+    return () => clearInterval(timer);
+  }, [runningJobs, latestJob]);
+
+  useEffect(() => {
     const timer = setInterval(() => {
       getHealth().then(setHealth).catch(() => setHealth(null));
-      if (runningJobs || tab === 'jobs') refreshJobs();
-    }, 3000);
+    }, 45000);
     return () => clearInterval(timer);
-  }, [runningJobs, tab]);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (refAudioPreviewUrl) URL.revokeObjectURL(refAudioPreviewUrl);
+    };
+  }, [refAudioPreviewUrl]);
 
   return (
     <main className="app">
-      <Header health={health} />
-      <Tabs active={tab} onChange={setTab} />
-      {tab === 'short' && <ShortTtsPanel />}
-      {tab === 'long' && <LongJobPanel onCreated={() => { refreshJobs(); setTab('jobs'); }} />}
-      {tab === 'jobs' && <JobsPanel jobs={jobs} refresh={refreshJobs} />}
+      <header className="topbar">
+        <div>
+          <h1>OmniVoice Long Text Studio</h1>
+          <p>Luồng nhanh: nhập văn bản → tạo âm thanh → tải kết quả.</p>
+        </div>
+        <div className="health">
+          <span className={health?.ok ? 'dot ok' : 'dot'} />
+          <div>
+            <b>{health?.ok ? 'API online' : 'API offline'}</b>
+            <small>{health ? `${health.device} · ${health.dtype}` : 'Không kết nối'}</small>
+          </div>
+        </div>
+      </header>
+
+      <div className="layout">
+        <section className="panel main-panel">
+          <div className="step-card">
+            <div className="step-head">
+              <h2>Bước 1: Nguồn văn bản</h2>
+              <span>{scriptText.trim().length.toLocaleString()} ký tự</span>
+            </div>
+            <div className="source-actions">
+              <button type="button" className="btn primary" onClick={openTextModal}>Nhập / sửa văn bản</button>
+              <label className="btn soft" htmlFor="script-file">Tải file .txt</label>
+              <input id="script-file" type="file" accept=".txt,text/plain" className="hidden" onChange={onScriptFile} />
+              <label className="source-lang">
+                <span>Language</span>
+                <select value={normalizeLanguageValue(settings.language)} onChange={(e) => setSettings({ language: e.target.value })}>
+                  {PRIMARY_LANGUAGES.map((lang) => (
+                    <option key={lang} value={lang}>{lang}</option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                className="btn ghost"
+                disabled={runningJobs}
+                onClick={() => {
+                  if (!ensureCanLoadScript()) return;
+                  setScriptText('');
+                  setScriptFileName('');
+                  setViewMode('draft');
+                }}
+              >
+                Xóa nội dung
+              </button>
+            </div>
+            {scriptText.trim() ? (
+              <div className="script-preview">
+                <div className="script-meta">
+                  <span>{scriptFileName || 'Nhập thủ công'}</span>
+                  <span>{draftRows.length.toLocaleString()} chunk dự kiến</span>
+                </div>
+                <textarea readOnly value={scriptText} rows={5} />
+              </div>
+            ) : null}
+          </div>
+
+          <div className="step-card">
+            <div className="step-head">
+              <h2>Bước 2: Hàng đợi chunk</h2>
+              <div className="inline-tools queue-tools">
+                <span className="queue-single">{viewMode === 'draft' ? 'Đang xem chunk văn bản mới' : 'Đang xem tiến độ job'}</span>
+                <button type="button" className="btn ghost" onClick={() => { void refreshJobs(); }}>Làm mới</button>
+              </div>
+            </div>
+
+            <div className="table-wrap">
+              <table className="queue-table">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Nội dung</th>
+                    <th>Ký tự</th>
+                    <th>Pause</th>
+                    <th>Dur</th>
+                    <th>Trạng thái</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="empty">Chưa có chunk. Hãy nhập văn bản ở bước 1.</td>
+                    </tr>
+                  ) : (
+                    rows.map((row, idx) => (
+                      <tr key={row.id}>
+                        <td>{idx + 1}</td>
+                        <td className="chunk" title={row.text}>{row.text}</td>
+                        <td>{row.chars}</td>
+                        <td>{row.pause != null ? `${row.pause.toFixed(2)}s` : '-'}</td>
+                        <td>{row.duration ? fmtSeconds(row.duration) : '-'}</td>
+                        <td><StatusPill status={row.status} /></td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="step-card run-card">
+            <div className="step-head">
+              <h2>Bước 3: Render & theo dõi</h2>
+              <span>{progress}%</span>
+            </div>
+
+            <div className="progress">
+              <div className="progress-bar" style={{ width: `${progress}%` }} />
+            </div>
+
+            <div className="run-stats">
+              <span>Chunks: {summary?.completed_chunks ?? 0}/{summary?.total_chunks ?? rows.length}</span>
+              <span>Thời lượng: {fmtSeconds(summary?.total_audio_duration)}</span>
+            </div>
+
+            <div className="run-actions">
+              <button type="button" className="btn primary" onClick={submitJob} disabled={submitUiLocked || busy || runningJobs || !!activeJob}>
+                {creatingJob ? (
+                  <>
+                    <span className="btn-spinner" aria-hidden="true" />
+                    Đang gửi job...
+                  </>
+                ) : 'Tạo âm thanh'}
+              </button>
+              <button type="button" className="btn danger" onClick={stopJob} disabled={!latestJob || latestJob.status !== 'running'}>Dừng job</button>
+              {latestJob?.output_exists && (
+                <a className="btn success" href={downloadUrl(latestJob.id)}>Tải audio</a>
+              )}
+              {latestJob?.log_exists && (
+                <a className="btn soft" href={logUrl(latestJob.id)} target="_blank" rel="noreferrer">Xem log</a>
+              )}
+            </div>
+
+            {creatingJob && (
+              <div className="pending-box" role="status" aria-live="polite">
+                <span className="pending-dot" />
+                <span>Đang tạo job trên server, vui lòng chờ...</span>
+              </div>
+            )}
+
+            {latestJob?.output_exists && (
+              <div className="audio-preview">
+                <b>Nghe audio kết quả</b>
+                <audio controls preload="metadata" src={`${downloadUrl(latestJob.id)}?t=${encodeURIComponent(latestJob.updated_at)}`} />
+              </div>
+            )}
+          </div>
+        </section>
+
+        <aside className="panel side-panel">
+          <div className="side-head">
+            <h2>Cài đặt</h2>
+            <div className="inline-tools">
+              <button type="button" className="btn success" onClick={saveSettings}>Lưu</button>
+              <button type="button" className="btn ghost" onClick={resetSettings}>Đặt lại</button>
+            </div>
+          </div>
+
+          <details open>
+            <summary>Giọng nói</summary>
+            <div className="group">
+              <label>Reference audio
+                <input ref={refAudioRef} type="file" accept="audio/*" onChange={onRefAudioFile} />
+              </label>
+              {refAudioPreviewUrl && (
+                <div className="audio-preview">
+                  <b>Nghe thử reference</b>
+                  <audio controls preload="metadata" src={refAudioPreviewUrl} />
+                </div>
+              )}
+              <label>Reference text
+                <textarea rows={4} value={String(settings.ref_text)} onChange={(e) => setSettings({ ref_text: e.target.value })} />
+              </label>
+              <label>Tên giọng lưu
+                <input value={voiceName} onChange={(e) => setVoiceName(e.target.value)} placeholder="Ví dụ: Nữ miền Nam nhẹ" />
+              </label>
+              <div className="inline-tools">
+                <button type="button" className="btn warn" onClick={saveVoicePreset}>Lưu giọng</button>
+                <button type="button" className="btn ghost" onClick={loadVoicePreset}>Nạp giọng</button>
+              </div>
+              <label>Giọng đã lưu
+                <select value={selectedPresetId} onChange={(e) => setSelectedPresetId(e.target.value)}>
+                  <option value="">-- Chọn giọng --</option>
+                  {voicePresets.map((preset) => (
+                    <option key={preset.id} value={preset.id}>{preset.name}</option>
+                  ))}
+                </select>
+              </label>
+              <button type="button" className="btn ghost" onClick={deleteVoicePreset}>Xóa giọng đã chọn</button>
+            </div>
+          </details>
+
+          <details>
+            <summary>Mô hình & render (nâng cao)</summary>
+            <div className="group grid2">
+              <label>Model
+                <input value={String(settings.model)} onChange={(e) => setSettings({ model: e.target.value })} />
+              </label>
+              <label>Steps
+                <input type="number" value={String(settings.num_step)} onChange={(e) => setSettings({ num_step: e.target.value })} />
+              </label>
+              <label>CFG
+                <input type="number" step="0.1" value={String(settings.guidance_scale)} onChange={(e) => setSettings({ guidance_scale: e.target.value })} />
+              </label>
+              <label>Max chars
+                <input type="number" value={String(settings.max_chars)} onChange={(e) => setSettings({ max_chars: e.target.value })} />
+              </label>
+              <label>Min chars
+                <input type="number" value={String(settings.min_chars)} onChange={(e) => setSettings({ min_chars: e.target.value })} />
+              </label>
+              <label>Speed
+                <input type="number" step="0.05" value={String(settings.speed)} onChange={(e) => setSettings({ speed: e.target.value })} />
+              </label>
+              <label>Pause scale
+                <input type="number" step="0.05" value={String(settings.pause_scale)} onChange={(e) => setSettings({ pause_scale: e.target.value })} />
+              </label>
+            </div>
+            <div className="group checks">
+              <label className="check"><input type="checkbox" checked={Boolean(settings.smart_pause)} onChange={(e) => setSettings({ smart_pause: e.target.checked })} /> Smart pause</label>
+              <label className="check"><input type="checkbox" checked={Boolean(settings.postprocess_output)} onChange={(e) => setSettings({ postprocess_output: e.target.checked })} /> Postprocess output</label>
+            </div>
+          </details>
+
+          <details>
+            <summary>Ngắt nghỉ</summary>
+            <div className="group grid2">
+              <label>Dấu phẩy
+                <input type="number" step="0.01" value={String(settings.comma_pause)} onChange={(e) => setSettings({ comma_pause: e.target.value })} />
+              </label>
+              <label>Dấu chấm
+                <input type="number" step="0.01" value={String(settings.sentence_pause)} onChange={(e) => setSettings({ sentence_pause: e.target.value })} />
+              </label>
+              <label>Đoạn văn
+                <input type="number" step="0.01" value={String(settings.paragraph_pause)} onChange={(e) => setSettings({ paragraph_pause: e.target.value })} />
+              </label>
+            </div>
+          </details>
+        </aside>
+      </div>
+
+      {textModalOpen && (
+        <div className="modal-backdrop" role="dialog" aria-modal="true">
+          <div className="modal">
+            <div className="modal-head">
+              <h2>Nhập văn bản dài</h2>
+              <button type="button" className="btn ghost" onClick={() => setTextModalOpen(false)}>Đóng</button>
+            </div>
+            <textarea
+              className="modal-textarea"
+              value={modalDraft}
+              onChange={(e) => setModalDraft(e.target.value)}
+              autoFocus
+              placeholder="Dán nội dung dài tại đây..."
+            />
+            <div className="modal-foot">
+              <span>{modalDraft.trim().length.toLocaleString()} ký tự</span>
+              <span>{splitPreview(modalDraft, Number(settings.max_chars) || 1200).length.toLocaleString()} chunk dự kiến</span>
+              <div className="inline-tools">
+                <button type="button" className="btn ghost" onClick={() => setModalDraft('')}>Xóa</button>
+                <button type="button" className="btn primary" onClick={applyTextModal}>Áp dụng</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <Toast toast={toast} />
     </main>
   );
 }

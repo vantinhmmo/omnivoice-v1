@@ -22,7 +22,7 @@ Example:
         --ref_audio voice.wav \
         --ref_text "Reference transcript." \
         --language vi \
-        --num_step 16
+        --num_step 32
 """
 
 import argparse
@@ -661,7 +661,7 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_chars", type=int, default=1200)
     parser.add_argument("--min_chars", type=int, default=120)
 
-    parser.add_argument("--num_step", type=int, default=16)
+    parser.add_argument("--num_step", type=int, default=32)
     parser.add_argument("--guidance_scale", type=float, default=2.0)
     parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument("--t_shift", type=float, default=0.1)

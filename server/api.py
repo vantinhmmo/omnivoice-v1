@@ -167,6 +167,63 @@ def refresh_job_status(meta: Dict[str, Any]) -> Dict[str, Any]:
     return meta
 
 
+ACTIVE_LONG_JOB_STATUSES = {"queued", "pending", "running"}
+JOB_SUBMIT_LOCK = JOBS_DIR / ".create_job.lock"
+
+
+def find_active_long_job() -> Optional[Dict[str, Any]]:
+    for path in sorted(JOBS_DIR.glob("*/job.json"), reverse=True):
+        try:
+            meta = refresh_job_status(read_json(path))
+            if meta.get("status") in ACTIVE_LONG_JOB_STATUSES:
+                return read_job(meta["id"])
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _raise_active_job(active: Optional[Dict[str, Any]] = None) -> None:
+    active = active or find_active_long_job()
+    detail: Dict[str, Any] = {
+        "message": "Đang có job hoạt động. Vui lòng chờ job xong hoặc bấm Dừng job trước khi tạo job mới.",
+    }
+    if active:
+        detail.update({"job_id": active.get("id"), "status": active.get("status")})
+    raise HTTPException(status_code=409, detail=detail)
+
+
+def acquire_job_submit_lock() -> Path:
+    active = find_active_long_job()
+    if active:
+        _raise_active_job(active)
+
+    try:
+        fd = os.open(str(JOB_SUBMIT_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        active = find_active_long_job()
+        if active:
+            _raise_active_job(active)
+        try:
+            JOB_SUBMIT_LOCK.unlink()
+        except OSError:
+            pass
+        try:
+            fd = os.open(str(JOB_SUBMIT_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            _raise_active_job()
+
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"created_at": utc_now()}, f)
+    return JOB_SUBMIT_LOCK
+
+
+def release_job_submit_lock(lock_path: Path) -> None:
+    try:
+        lock_path.unlink()
+    except OSError:
+        pass
+
+
 @app.get("/api/health")
 def health() -> Dict[str, Any]:
     return {
@@ -197,7 +254,7 @@ async def short_tts(
     ref_audio: Optional[UploadFile] = File(None),
     ref_text: Optional[str] = Form(None),
     instruct: Optional[str] = Form(None),
-    num_step: int = Form(16),
+    num_step: int = Form(32),
     guidance_scale: float = Form(2.0),
     speed: float = Form(1.0),
     duration: Optional[float] = Form(None),
@@ -261,7 +318,7 @@ async def create_long_job(
     language: Optional[str] = Form(None),
     model: str = Form(DEFAULT_MODEL),
     output_format: str = Form("wav"),
-    num_step: int = Form(16),
+    num_step: int = Form(32),
     max_chars: int = Form(1200),
     min_chars: int = Form(120),
     guidance_scale: float = Form(2.0),
@@ -276,6 +333,7 @@ async def create_long_job(
     if not script_text and (script_file is None or not script_file.filename):
         raise HTTPException(status_code=400, detail="script_text or script_file is required")
 
+    lock_path = acquire_job_submit_lock()
     job_id = uuid.uuid4().hex[:12]
     jdir = job_dir(job_id)
     jdir.mkdir(parents=True, exist_ok=True)
@@ -365,6 +423,7 @@ async def create_long_job(
         "command": cmd,
     }
     write_json(job_meta_path(job_id), meta)
+    release_job_submit_lock(lock_path)
     return read_job(job_id)
 
 
