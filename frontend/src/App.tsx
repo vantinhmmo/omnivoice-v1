@@ -24,6 +24,7 @@ type ToastState = { message: string; type: 'ok' | 'error' } | null;
 
 const SETTINGS_LS_KEY = 'omnivoice.longtext.settings.v1';
 const VOICE_PRESETS_LS_KEY = 'omnivoice.longtext.voice-presets.v1';
+const CLIENT_USER_ID_LS_KEY = 'omnivoice.longtext.client-user-id.v1';
 
 const DEFAULT_SETTINGS: SettingsState = {
   model: 'k2-fsa/OmniVoice',
@@ -127,6 +128,18 @@ function safeLoadPresets(): VoicePreset[] {
   }
 }
 
+function safeLoadClientUserId(): string {
+  try {
+    const existing = localStorage.getItem(CLIENT_USER_ID_LS_KEY);
+    if (existing && existing.trim()) return existing.trim();
+    const generated = crypto.randomUUID();
+    localStorage.setItem(CLIENT_USER_ID_LS_KEY, generated);
+    return generated;
+  } catch {
+    return crypto.randomUUID();
+  }
+}
+
 function pct(job?: LongJob | null): number {
   const summary = job?.manifest?.summary;
   const total = summary?.total_chunks ?? 0;
@@ -226,6 +239,8 @@ export default function App() {
   const [voiceName, setVoiceName] = useState('');
   const [toast, setToast] = useState<ToastState>(null);
 
+  const [clientUserId] = useState<string>(() => safeLoadClientUserId());
+
   const latestJob = jobs[0] ?? null;
   const draftRows = useMemo(() => splitPreview(scriptText, Number(settings.max_chars) || 1200), [scriptText, settings.max_chars]);
   const latestJobRows = useMemo(() => (latestJob ? jobRows(latestJob) : []), [latestJob]);
@@ -241,7 +256,8 @@ export default function App() {
   const summary = latestJob?.manifest?.summary;
   const progress = pct(latestJob);
   const activeJob = useMemo(() => jobs.find((j) => isActiveStatus(deriveEffectiveJobStatus(j))) ?? null, [jobs]);
-  const creatingJob = busy || runningJobs || latestJobHasActiveChunks || !!activeJob;
+  const creatingJob = busy;
+  const hasAnyActiveJobs = runningJobs || latestJobHasActiveChunks || !!activeJob;
   const canStopJob = !!latestJob && isActiveStatus(latestJobStatus) && !latestJob.output_exists;
 
   const debugEnabled = false;
@@ -317,32 +333,22 @@ export default function App() {
 
   async function refreshJobs() {
     try {
-      const next = await listJobs();
-
-      // Ưu tiên job active; nếu không có thì chọn job mới nhất theo updated_at.
-      const active = next.find((j) => isActiveStatus(deriveEffectiveJobStatus(j))) ?? null;
-      const newest = [...next].sort((a, b) => {
-        const ta = Date.parse(String(a.updated_at ?? a.created_at ?? '')) || 0;
-        const tb = Date.parse(String(b.updated_at ?? b.created_at ?? '')) || 0;
-        return tb - ta;
-      })[0] ?? null;
-      const preferred = active ?? newest;
-      const one = preferred ? [preferred] : [];
+      const next = await listJobs(clientUserId);
 
       if (debugEnabled) {
         console.debug('[UI][refreshJobs] fetched', {
           count: next.length,
-          picked: one[0]
+          head: next[0]
             ? {
-                id: one[0].id,
-                status: one[0].status,
-                chunkStatuses: (one[0].manifest?.chunks ?? []).map((c) => c.status),
+                id: next[0].id,
+                status: next[0].status,
+                chunkStatuses: (next[0].manifest?.chunks ?? []).map((c) => c.status),
               }
             : null,
         });
       }
-      setJobs(one);
-      if (!one.length) setViewMode('draft');
+      setJobs(next);
+      if (!next.length) setViewMode('draft');
     } catch (err) {
       console.error(err);
       if (debugEnabled) console.debug('[UI][refreshJobs] error', err);
@@ -350,10 +356,6 @@ export default function App() {
   }
 
   function ensureCanLoadScript(): boolean {
-    if (runningJobs) {
-      flash('Đang có job chạy. Hãy dừng hoặc chờ job xong rồi mới nạp văn bản mới.', 'error');
-      return false;
-    }
     return true;
   }
 
@@ -421,10 +423,6 @@ export default function App() {
       flash('Yêu cầu tạo job đang được xử lý, vui lòng chờ.', 'error');
       return;
     }
-    if (activeJob || runningJobs || latestJobHasActiveChunks) {
-      flash('Đang có job hoạt động. Chỉ được chạy 1 job tại 1 thời điểm.', 'error');
-      return;
-    }
     if (!scriptText.trim()) {
       openTextModal();
       return;
@@ -436,6 +434,7 @@ export default function App() {
     try {
       const form = new FormData();
       form.set('script_text', scriptText);
+      form.set('user_id', clientUserId);
       for (const [key, value] of Object.entries(settings)) {
         form.set(key, String(value));
       }
@@ -443,7 +442,7 @@ export default function App() {
       if (refFile) form.set('ref_audio', refFile);
       const job = await createLongJob(form);
       if (debugEnabled) console.debug('[UI][submitJob] createLongJob response', { id: job.id, status: job.status });
-      setJobs([job]);
+      setJobs((current) => [job, ...current]);
       setViewMode('job');
       await refreshJobs();
       flash(`Đã tạo job ${job.id}`, 'ok');
@@ -480,9 +479,9 @@ export default function App() {
       return;
     }
     try {
-      const cancelled = await cancelJob(latestJob.id);
+      const cancelled = await cancelJob(latestJob.id, clientUserId);
       if (debugEnabled) console.debug('[UI][stopJob] cancel response', { id: cancelled.id, status: cancelled.status });
-      setJobs([cancelled]);
+      setJobs((current) => [cancelled, ...current.filter((j) => j.id !== cancelled.id)]);
       await refreshJobs();
       flash(`Đã gửi lệnh dừng job ${latestJob.id}`, 'ok');
     } catch (err) {
@@ -502,7 +501,7 @@ export default function App() {
       if (runningJobs || latestJob) refreshJobs();
     }, intervalMs);
     return () => clearInterval(timer);
-  }, [runningJobs, latestJob]);
+  }, [runningJobs, latestJob, clientUserId]);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -535,7 +534,7 @@ export default function App() {
       creatingJob,
       canStopJob,
     });
-  }, [jobs, latestJob, latestJobStatus, runningJobs, latestJobHasActiveChunks, activeJob, busy, submitUiLocked, creatingJob, canStopJob]);
+  }, [jobs, latestJob, latestJobStatus, runningJobs, latestJobHasActiveChunks, activeJob, busy, submitUiLocked, creatingJob, canStopJob, hasAnyActiveJobs]);
 
   return (
     <main className="app">
@@ -575,7 +574,7 @@ export default function App() {
               <button
                 type="button"
                 className="btn ghost"
-                disabled={runningJobs}
+                disabled={false}
                 onClick={() => {
                   if (!ensureCanLoadScript()) return;
                   setScriptText('');
@@ -660,7 +659,7 @@ export default function App() {
                 type="button"
                 className="btn primary"
                 onClick={submitJob}
-                disabled={submitUiLocked || busy || runningJobs || latestJobHasActiveChunks || !!activeJob}
+                disabled={submitUiLocked || busy}
                 aria-busy={creatingJob}
               >
                 {creatingJob ? (
@@ -672,14 +671,14 @@ export default function App() {
               </button>
               <button type="button" className="btn danger" onClick={stopJob} disabled={!canStopJob}>Dừng job</button>
               {latestJob?.output_exists && (
-                <a className="btn success" href={downloadUrl(latestJob.id)}>Tải audio</a>
+                <a className="btn success" href={downloadUrl(latestJob.id, clientUserId)}>Tải audio</a>
               )}
               {latestJob?.log_exists && (
-                <a className="btn soft" href={logUrl(latestJob.id)} target="_blank" rel="noreferrer">Xem log</a>
+                <a className="btn soft" href={logUrl(latestJob.id, clientUserId)} target="_blank" rel="noreferrer">Xem log</a>
               )}
             </div>
 
-            {creatingJob && (
+            {hasAnyActiveJobs && (
               <div className="pending-box" role="status" aria-live="polite">
                 <span className="pending-dot" />
                 <span>
@@ -693,7 +692,7 @@ export default function App() {
             {latestJob?.output_exists && (
               <div className="audio-preview">
                 <b>Nghe audio kết quả</b>
-                <audio controls preload="metadata" src={`${downloadUrl(latestJob.id)}?t=${encodeURIComponent(latestJob.updated_at)}`} />
+                <audio controls preload="metadata" src={`${downloadUrl(latestJob.id, clientUserId)}&t=${encodeURIComponent(latestJob.updated_at)}`} />
               </div>
             )}
           </div>

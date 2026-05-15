@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import soundfile as sf
 import torch
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -128,6 +128,21 @@ def job_meta_path(job_id: str) -> Path:
 
 def manifest_path(job_id: str) -> Path:
     return job_dir(job_id) / "work" / "manifest.json"
+
+
+def normalize_user_id(user_id: Optional[str]) -> str:
+    raw = str(user_id or "").strip().lower()
+    safe = "".join(c for c in raw if c.isalnum() or c in "-_.:@")
+    return safe[:120] or "anonymous"
+
+
+def ensure_job_access(meta: Dict[str, Any], user_id: Optional[str]) -> None:
+    if user_id is None:
+        return
+    requested_user = normalize_user_id(user_id)
+    owner_user = normalize_user_id(meta.get("user_id"))
+    if requested_user != owner_user:
+        raise HTTPException(status_code=404, detail="Job not found")
 
 
 def read_job(job_id: str) -> Dict[str, Any]:
@@ -363,12 +378,16 @@ def _sort_jobs_by_time_desc(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return jobs
 
 
-def _collect_jobs() -> List[Dict[str, Any]]:
+def _collect_jobs(user_id: Optional[str] = None) -> List[Dict[str, Any]]:
     jobs: List[Dict[str, Any]] = []
+    requested_user = normalize_user_id(user_id) if user_id is not None else None
     for path in JOBS_DIR.glob("*/job.json"):
         try:
             meta = refresh_job_status(read_json(path))
-            jobs.append(read_job(meta["id"]))
+            job = read_job(meta["id"])
+            if requested_user is not None and normalize_user_id(job.get("user_id")) != requested_user:
+                continue
+            jobs.append(job)
         except Exception:  # noqa: BLE001
             continue
     return _sort_jobs_by_time_desc(jobs)
@@ -534,6 +553,7 @@ async def create_long_job(
     ref_audio: Optional[UploadFile] = File(None),
     ref_text: Optional[str] = Form(None),
     language: Optional[str] = Form(None),
+    user_id: Optional[str] = Form(None),
     model: str = Form(DEFAULT_MODEL),
     output_format: str = Form("wav"),
     num_step: int = Form(32),
@@ -619,6 +639,7 @@ async def create_long_job(
 
         meta = {
             "id": job_id,
+            "user_id": normalize_user_id(user_id),
             "status": "queued",
             "pid": None,
             "created_at": utc_now(),
@@ -638,23 +659,27 @@ async def create_long_job(
 
 
 @app.get("/api/jobs")
-def list_jobs() -> Dict[str, Any]:
+def list_jobs(user_id: Optional[str] = Query(None)) -> Dict[str, Any]:
     dispatch_next_queued_job()
-    return {"jobs": _collect_jobs()}
+    return {"jobs": _collect_jobs(user_id=user_id)}
 
 
 @app.get("/api/jobs/{job_id}")
-def get_job(job_id: str) -> Dict[str, Any]:
+def get_job(job_id: str, user_id: Optional[str] = Query(None)) -> Dict[str, Any]:
     job = refresh_job_status(read_job(job_id))
+    ensure_job_access(job, user_id)
     dispatch_next_queued_job()
-    return read_job(str(job.get("id") or job_id))
+    updated = read_job(str(job.get("id") or job_id))
+    ensure_job_access(updated, user_id)
+    return updated
 
 
 @app.post("/api/jobs/{job_id}/cancel")
-def cancel_job(job_id: str) -> Dict[str, Any]:
+def cancel_job(job_id: str, user_id: Optional[str] = Query(None)) -> Dict[str, Any]:
     logger.info("[cancel_job] request received: job_id=%s", job_id)
 
     meta = read_job(job_id)
+    ensure_job_access(meta, user_id)
     pid = meta.get("pid")
     was_running = bool(pid and is_pid_running(pid))
     logger.info(
@@ -737,8 +762,9 @@ def cancel_job(job_id: str) -> Dict[str, Any]:
 
 
 @app.get("/api/jobs/{job_id}/download")
-def download_job(job_id: str) -> FileResponse:
+def download_job(job_id: str, user_id: Optional[str] = Query(None)) -> FileResponse:
     meta = read_job(job_id)
+    ensure_job_access(meta, user_id)
     output = Path(meta.get("output", ""))
     if not output.exists():
         raise HTTPException(status_code=404, detail="Output file is not ready")
@@ -747,8 +773,9 @@ def download_job(job_id: str) -> FileResponse:
 
 
 @app.get("/api/jobs/{job_id}/log")
-def download_log(job_id: str) -> FileResponse:
+def download_log(job_id: str, user_id: Optional[str] = Query(None)) -> FileResponse:
     meta = read_job(job_id)
+    ensure_job_access(meta, user_id)
     log_path = Path(meta.get("log", ""))
     if not log_path.exists():
         raise HTTPException(status_code=404, detail="Log file not found")
