@@ -663,10 +663,10 @@ export default function App() {
                 type="button"
                 className="btn primary"
                 onClick={submitJob}
-                disabled={submitUiLocked || busy}
-                aria-busy={busy}
+                disabled={submitUiLocked || creatingJob}
+                aria-busy={creatingJob}
               >
-                {busy ? (
+                {creatingJob ? (
                   <>
                     <span className="btn-spinner" aria-hidden="true" />
                     Đang tạo voice...
