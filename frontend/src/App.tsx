@@ -547,7 +547,11 @@ export default function App() {
           <span className={health?.ok ? 'dot ok' : 'dot'} />
           <div>
             <b>{health?.ok ? 'API online' : 'API offline'}</b>
-            <small>{health ? `${health.device} · ${health.dtype}` : 'Không kết nối'}</small>
+            <small>
+              {health
+                ? `${health.device} · ${health.dtype} · Running ${health.running_long_jobs ?? 0}/${health.max_concurrent_long_jobs ?? 0} · Queue ${health.queued_long_jobs ?? 0}`
+                : 'Không kết nối'}
+            </small>
           </div>
         </div>
       </header>

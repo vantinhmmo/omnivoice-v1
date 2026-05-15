@@ -460,8 +460,34 @@ def dispatch_next_queued_job() -> Optional[Dict[str, Any]]:
         return dispatched[0] if dispatched else None
 
 
+def collect_server_queue_stats() -> Dict[str, int]:
+    running = 0
+    queued = 0
+    total = 0
+
+    for path in JOBS_DIR.glob("*/job.json"):
+        try:
+            meta = refresh_job_status(read_json(path))
+            status = str(meta.get("status", "")).lower()
+            total += 1
+            if status == "running":
+                running += 1
+            elif status in {"queued", "pending"}:
+                queued += 1
+        except Exception:  # noqa: BLE001
+            continue
+
+    return {
+        "running_long_jobs": running,
+        "queued_long_jobs": queued,
+        "total_long_jobs": total,
+        "active_long_jobs": running + queued,
+    }
+
+
 @app.get("/api/health")
 def health() -> Dict[str, Any]:
+    queue_stats = collect_server_queue_stats()
     return {
         "ok": True,
         "model": DEFAULT_MODEL,
@@ -471,6 +497,7 @@ def health() -> Dict[str, Any]:
         "model_loaded": _model is not None,
         "anti_spam_version": "guard-atomic-v1",
         "max_concurrent_long_jobs": MAX_CONCURRENT_LONG_JOBS,
+        **queue_stats,
     }
 
 

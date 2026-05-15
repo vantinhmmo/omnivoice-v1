@@ -5,6 +5,11 @@ export type Health = {
   dtype: string;
   cuda: boolean;
   model_loaded: boolean;
+  max_concurrent_long_jobs?: number;
+  running_long_jobs?: number;
+  queued_long_jobs?: number;
+  active_long_jobs?: number;
+  total_long_jobs?: number;
 };
 
 export type JobSummary = {
