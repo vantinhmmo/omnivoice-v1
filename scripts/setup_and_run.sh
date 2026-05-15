@@ -38,23 +38,68 @@ echo "[INFO] OMNIVOICE_DEVICE=$OMNIVOICE_DEVICE"
 echo "[INFO] OMNIVOICE_DTYPE=$OMNIVOICE_DTYPE"
 echo "[INFO] OMNIVOICE_MAX_CONCURRENT_LONG_JOBS=$OMNIVOICE_MAX_CONCURRENT_LONG_JOBS"
 
-echo "[STEP] Checking required tools..."
-command -v npm >/dev/null 2>&1 || { echo "[ERROR] npm not found (install Node.js first)"; exit 1; }
+echo "[STEP] Checking / installing required tools..."
 
-# Python resolver: prefer python3, fallback python/py
-PYTHON_CMD=""
-if command -v python3 >/dev/null 2>&1; then
-  PYTHON_CMD="python3"
-elif command -v python >/dev/null 2>&1; then
-  PYTHON_CMD="python"
-elif command -v py >/dev/null 2>&1; then
-  PYTHON_CMD="py"
-else
-  echo "[ERROR] No Python command found (python3/python/py)"
-  exit 1
-fi
+run_as_root() {
+  if command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    "$@"
+  fi
+}
 
+apt_install() {
+  local pkgs=("$@")
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "[ERROR] apt-get not found. Please install manually: ${pkgs[*]}"
+    exit 1
+  fi
+  run_as_root apt-get update
+  run_as_root apt-get install -y "${pkgs[@]}"
+}
+
+ensure_python3() {
+  if command -v python3 >/dev/null 2>&1; then
+    return
+  fi
+  echo "[INFO] python3 not found -> installing python3 + venv + pip"
+  apt_install python3 python3-venv python3-pip
+}
+
+ensure_nodejs() {
+  local need_install=0
+  if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+    need_install=1
+  else
+    local major
+    major="$(node -v 2>/dev/null | sed 's/^v//' | cut -d. -f1 || echo 0)"
+    if [[ -z "$major" || "$major" -lt 18 ]]; then
+      echo "[INFO] Node.js version too old (<18), upgrading to Node 20"
+      need_install=1
+    fi
+  fi
+
+  if [[ "$need_install" -eq 1 ]]; then
+    if ! command -v curl >/dev/null 2>&1; then
+      apt_install curl
+    fi
+    if ! command -v apt-get >/dev/null 2>&1; then
+      echo "[ERROR] Cannot auto-install Node.js without apt-get"
+      exit 1
+    fi
+    curl -fsSL https://deb.nodesource.com/setup_20.x | run_as_root bash -
+    run_as_root apt-get install -y nodejs
+  fi
+}
+
+ensure_python3
+ensure_nodejs
+command -v curl >/dev/null 2>&1 || apt_install curl
+command -v ffmpeg >/dev/null 2>&1 || apt_install ffmpeg
+
+PYTHON_CMD="python3"
 echo "[INFO] Using Python command: $PYTHON_CMD"
+echo "[INFO] Node version: $(node -v) | npm version: $(npm -v)"
 
 if [[ ! -f "requirements.txt" ]]; then
   echo "[ERROR] requirements.txt not found in $ROOT_DIR"
