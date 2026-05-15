@@ -44,6 +44,42 @@ const DEFAULT_SETTINGS: SettingsState = {
 };
 
 const PRIMARY_LANGUAGES = ['Auto', 'Vietnamese', 'English', 'Thai', 'Japanese', 'Spanish', 'Indonesian', 'French'] as const;
+const ACTIVE_STATUSES = ['running', 'queued', 'pending'] as const;
+const TERMINAL_STATUSES = ['cancelled', 'stopped', 'done', 'failed', 'merged'] as const;
+
+function normalizeStatus(status?: string | null): string {
+  return String(status ?? '').trim().toLowerCase();
+}
+
+function isActiveStatus(status?: string | null): boolean {
+  return ACTIVE_STATUSES.includes(normalizeStatus(status) as (typeof ACTIVE_STATUSES)[number]);
+}
+
+function isTerminalStatus(status?: string | null): boolean {
+  return TERMINAL_STATUSES.includes(normalizeStatus(status) as (typeof TERMINAL_STATUSES)[number]);
+}
+
+function hasActiveChunks(job?: LongJob | null): boolean {
+  if (!job) return false;
+  return (job.manifest?.chunks ?? []).some((chunk) => isActiveStatus(chunk.status));
+}
+
+function deriveEffectiveJobStatus(job?: LongJob | null): string {
+  if (!job) return '';
+
+  const rawStatus = normalizeStatus(job.status);
+  const finalStatus = normalizeStatus(job.manifest?.summary?.final_status);
+
+  if (finalStatus && isTerminalStatus(finalStatus)) {
+    return finalStatus;
+  }
+
+  if (job.output_exists && !hasActiveChunks(job) && isActiveStatus(rawStatus)) {
+    return 'done';
+  }
+
+  return rawStatus;
+}
 
 function normalizeLanguageValue(value: unknown): string {
   const raw = String(value ?? '').trim();
@@ -195,22 +231,18 @@ export default function App() {
   const latestJobRows = useMemo(() => (latestJob ? jobRows(latestJob) : []), [latestJob]);
   const rows = viewMode === 'job' ? (latestJobRows.length ? latestJobRows : draftRows) : draftRows;
 
-  const activeStatuses = ['running', 'queued', 'pending'] as const;
-  const terminalStatuses = ['cancelled', 'stopped', 'done', 'failed', 'merged'] as const;
-  const isActiveStatus = (status?: string | null) => activeStatuses.includes(String(status ?? '').toLowerCase() as (typeof activeStatuses)[number]);
-  const isTerminalStatus = (status?: string | null) => terminalStatuses.includes(String(status ?? '').toLowerCase() as (typeof terminalStatuses)[number]);
-
-  const runningJobs = useMemo(() => jobs.some((j) => isActiveStatus(j.status)), [jobs]);
+  const latestJobStatus = useMemo(() => deriveEffectiveJobStatus(latestJob), [latestJob]);
+  const runningJobs = useMemo(() => jobs.some((j) => isActiveStatus(deriveEffectiveJobStatus(j))), [jobs]);
   const latestJobHasActiveChunks = useMemo(() => {
     if (!latestJob) return false;
-    if (isTerminalStatus(latestJob.status)) return false;
-    return (latestJob.manifest?.chunks ?? []).some((c) => isActiveStatus(c.status));
-  }, [latestJob]);
+    if (isTerminalStatus(latestJobStatus)) return false;
+    return hasActiveChunks(latestJob);
+  }, [latestJob, latestJobStatus]);
   const summary = latestJob?.manifest?.summary;
   const progress = pct(latestJob);
-  const activeJob = useMemo(() => jobs.find((j) => isActiveStatus(j.status)) ?? null, [jobs]);
+  const activeJob = useMemo(() => jobs.find((j) => isActiveStatus(deriveEffectiveJobStatus(j))) ?? null, [jobs]);
   const creatingJob = busy || runningJobs || latestJobHasActiveChunks || !!activeJob;
-  const canStopJob = !!latestJob && isActiveStatus(latestJob.status);
+  const canStopJob = !!latestJob && isActiveStatus(latestJobStatus) && !latestJob.output_exists;
 
   const debugEnabled = false;
 
@@ -288,7 +320,7 @@ export default function App() {
       const next = await listJobs();
 
       // Ưu tiên job active; nếu không có thì chọn job mới nhất theo updated_at.
-      const active = next.find((j) => isActiveStatus(j.status)) ?? null;
+      const active = next.find((j) => isActiveStatus(deriveEffectiveJobStatus(j))) ?? null;
       const newest = [...next].sort((a, b) => {
         const ta = Date.parse(String(a.updated_at ?? a.created_at ?? '')) || 0;
         const tb = Date.parse(String(b.updated_at ?? b.created_at ?? '')) || 0;
@@ -380,7 +412,7 @@ export default function App() {
         runningJobs,
         latestJobHasActiveChunks,
         activeJobId: activeJob?.id ?? null,
-        latestJobStatus: latestJob?.status ?? null,
+        latestJobStatus,
         creatingJob,
         canStopJob,
       });
@@ -428,7 +460,7 @@ export default function App() {
     if (debugEnabled) {
       console.debug('[UI][stopJob] click', {
         latestJobId: latestJob?.id ?? null,
-        latestJobStatus: latestJob?.status ?? null,
+        latestJobStatus,
         canStopJob,
         latestJobHasActiveChunks,
       });
@@ -438,7 +470,7 @@ export default function App() {
         console.debug('[UI][stopJob] early-return', {
           reason: !latestJob ? 'no-latest-job' : 'canStopJob=false',
           latestJobId: latestJob?.id ?? null,
-          latestJobStatus: latestJob?.status ?? null,
+          latestJobStatus,
           canStopJob,
           latestJobHasActiveChunks,
           runningJobs,
@@ -494,7 +526,7 @@ export default function App() {
         chunkStatuses: (j.manifest?.chunks ?? []).map((c) => c.status),
       })),
       latestJobId: latestJob?.id ?? null,
-      latestJobStatus: latestJob?.status ?? null,
+      latestJobStatus,
       runningJobs,
       latestJobHasActiveChunks,
       activeJobId: activeJob?.id ?? null,
@@ -503,7 +535,7 @@ export default function App() {
       creatingJob,
       canStopJob,
     });
-  }, [jobs, latestJob, runningJobs, latestJobHasActiveChunks, activeJob, busy, submitUiLocked, creatingJob, canStopJob]);
+  }, [jobs, latestJob, latestJobStatus, runningJobs, latestJobHasActiveChunks, activeJob, busy, submitUiLocked, creatingJob, canStopJob]);
 
   return (
     <main className="app">
