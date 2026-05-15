@@ -172,10 +172,62 @@ def is_pid_running(pid: Optional[int]) -> bool:
         return False
 
 
+def is_job_process_running(meta: Dict[str, Any]) -> bool:
+    """Check running state by PID + command line fingerprint to avoid PID reuse false positives."""
+    pid = meta.get("pid")
+    if not pid:
+        return False
+    try:
+        pid_int = int(pid)
+    except Exception:  # noqa: BLE001
+        return False
+
+    if not is_pid_running(pid_int):
+        return False
+
+    expected_cmd = " ".join(str(x) for x in (meta.get("command") or []))
+    if not expected_cmd:
+        return True
+
+    try:
+        if os.name == "nt":
+            # WMIC có sẵn trên nhiều máy Windows VPS; so cmdline để tránh PID recycle.
+            result = subprocess.run(
+                [
+                    "wmic",
+                    "process",
+                    "where",
+                    f"ProcessId={pid_int}",
+                    "get",
+                    "CommandLine",
+                    "/value",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            cmdline = (result.stdout or "").lower()
+            for token in ["omnivoice.cli.long_text", "--work_dir", "--output"]:
+                if token not in cmdline:
+                    return False
+            return True
+
+        proc_path = Path(f"/proc/{pid_int}/cmdline")
+        if not proc_path.exists():
+            return False
+        current_cmd = proc_path.read_text(encoding="utf-8", errors="ignore").replace("\x00", " ").lower()
+        for token in ["omnivoice.cli.long_text", "--work_dir", "--output"]:
+            if token not in current_cmd:
+                return False
+        return True
+    except Exception:  # noqa: BLE001
+        # Nếu không đọc được cmdline thì fallback về PID check để không chặn nhầm.
+        return True
+
+
 def refresh_job_status(meta: Dict[str, Any]) -> Dict[str, Any]:
     status = meta.get("status")
-    pid = meta.get("pid")
-    if status == "running" and not is_pid_running(pid):
+    if status == "running" and not is_job_process_running(meta):
         output = Path(meta.get("output", ""))
         if output.exists():
             meta["status"] = "done"
@@ -209,8 +261,8 @@ def find_active_long_job() -> Optional[Dict[str, Any]]:
             meta = read_json(path)
             status = str(meta.get("status", "")).lower()
 
-            # Nếu job được ghi running nhưng PID không còn sống thì coi là stopped.
-            if status == "running" and not is_pid_running(meta.get("pid")):
+            # Nếu job được ghi running nhưng process thực tế không còn đúng thì coi là stopped.
+            if status == "running" and not is_job_process_running(meta):
                 meta["status"] = "stopped"
                 meta["updated_at"] = utc_now()
                 write_json(path, meta)
@@ -254,7 +306,7 @@ def acquire_single_active_guard() -> None:
                 else:
                     meta = read_json(jpath)
                     status = str(meta.get("status", "")).lower()
-                    if status == "running" and not is_pid_running(meta.get("pid")):
+                    if status == "running" and not is_job_process_running(meta):
                         meta["status"] = "stopped"
                         meta["updated_at"] = utc_now()
                         write_json(jpath, meta)
@@ -708,7 +760,7 @@ def cancel_job(job_id: str, user_id: Optional[str] = Query(None)) -> Dict[str, A
     meta = read_job(job_id)
     ensure_job_access(meta, user_id)
     pid = meta.get("pid")
-    was_running = bool(pid and is_pid_running(pid))
+    was_running = bool(meta.get("status") == "running" and is_job_process_running(meta))
     logger.info(
         "[cancel_job] before kill: job_id=%s status=%s pid=%s is_running=%s",
         job_id,
@@ -737,7 +789,7 @@ def cancel_job(job_id: str, user_id: Optional[str] = Query(None)) -> Dict[str, A
             os.killpg(pid, signal.SIGTERM)
             logger.info("[cancel_job] sent SIGTERM to process group: job_id=%s pid=%s", job_id, pid)
 
-    is_running_after = bool(pid and is_pid_running(pid))
+    is_running_after = bool(meta.get("status") == "running" and is_job_process_running(meta))
     logger.info(
         "[cancel_job] after kill check: job_id=%s pid=%s is_running=%s",
         job_id,
