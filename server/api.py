@@ -42,6 +42,7 @@ SHORT_DIR = ROOT_DIR / "outputs" / "short"
 DEFAULT_MODEL = os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice")
 DEFAULT_DEVICE = os.environ.get("OMNIVOICE_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 DEFAULT_DTYPE = os.environ.get("OMNIVOICE_DTYPE", "auto")
+RESET_JOBS_ON_START = str2bool(os.environ.get("OMNIVOICE_RESET_JOBS_ON_START", "true"))
 
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 SHORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -58,6 +59,24 @@ app.add_middleware(
 _model: Optional[OmniVoice] = None
 _sampling_rate: Optional[int] = None
 logger = logging.getLogger("omnivoice.api")
+
+
+def clear_job_metadata_on_startup() -> None:
+    """Reset job state after server restart by removing all job.json files."""
+    removed = 0
+    for meta_path in JOBS_DIR.glob("*/job.json"):
+        try:
+            meta_path.unlink(missing_ok=True)
+            removed += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[startup-reset] cannot delete %s: %s", meta_path, exc)
+    logger.info("[startup-reset] removed job.json files: %s", removed)
+
+
+@app.on_event("startup")
+def on_startup_reset_jobs() -> None:
+    if RESET_JOBS_ON_START:
+        clear_job_metadata_on_startup()
 
 
 def utc_now() -> str:
