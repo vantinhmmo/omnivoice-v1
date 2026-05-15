@@ -671,7 +671,7 @@ export default function App() {
                     <span className="btn-spinner" aria-hidden="true" />
                     Đang tạo voice...
                   </>
-                ) : hasAnyActiveJobs ? 'Thêm vào hàng đợi' : 'Tạo âm thanh'}
+                ) : 'Tạo âm thanh'}
               </button>
               <button type="button" className="btn danger" onClick={stopJob} disabled={!canStopJob}>Dừng job</button>
               {latestJob?.output_exists && (
