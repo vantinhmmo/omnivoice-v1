@@ -256,8 +256,8 @@ export default function App() {
   const summary = latestJob?.manifest?.summary;
   const progress = pct(latestJob);
   const activeJob = useMemo(() => jobs.find((j) => isActiveStatus(deriveEffectiveJobStatus(j))) ?? null, [jobs]);
-  const creatingJob = busy;
   const hasAnyActiveJobs = runningJobs || latestJobHasActiveChunks || !!activeJob;
+  const creatingJob = busy || hasAnyActiveJobs;
   const canStopJob = !!latestJob && isActiveStatus(latestJobStatus) && !latestJob.output_exists;
 
   const debugEnabled = false;
@@ -660,14 +660,14 @@ export default function App() {
                 className="btn primary"
                 onClick={submitJob}
                 disabled={submitUiLocked || busy}
-                aria-busy={creatingJob}
+                aria-busy={busy}
               >
-                {creatingJob ? (
+                {busy ? (
                   <>
                     <span className="btn-spinner" aria-hidden="true" />
                     Đang tạo voice...
                   </>
-                ) : 'Tạo âm thanh'}
+                ) : hasAnyActiveJobs ? 'Thêm vào hàng đợi' : 'Tạo âm thanh'}
               </button>
               <button type="button" className="btn danger" onClick={stopJob} disabled={!canStopJob}>Dừng job</button>
               {latestJob?.output_exists && (
