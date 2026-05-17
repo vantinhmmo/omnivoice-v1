@@ -56,6 +56,10 @@ try:
     DEFAULT_CHUNK_RETRY_DELAY = max(0.0, float(os.environ.get("OMNIVOICE_CHUNK_RETRY_DELAY", "2").strip()))
 except ValueError:
     DEFAULT_CHUNK_RETRY_DELAY = 2.0
+try:
+    DEFAULT_LONG_WORKER_POOL_SIZE = max(1, int(os.environ.get("OMNIVOICE_LONG_WORKER_POOL_SIZE", "1").strip()))
+except ValueError:
+    DEFAULT_LONG_WORKER_POOL_SIZE = 1
 RESET_JOBS_ON_START = str2bool(os.environ.get("OMNIVOICE_RESET_JOBS_ON_START", "true"))
 
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
@@ -97,6 +101,8 @@ def on_startup_reset_jobs() -> None:
 @app.on_event("shutdown")
 def on_shutdown_long_worker() -> None:
     LONG_JOB_WORKER_RUNNING.clear()
+    with LONG_JOB_WORKER_LOCK:
+        LONG_JOB_WORKER_THREADS.clear()
 
 
 def utc_now() -> str:
@@ -214,7 +220,7 @@ def is_pid_running(pid: Optional[int]) -> bool:
 def is_job_process_running(meta: Dict[str, Any]) -> bool:
     """Check running state for long jobs (subprocess or in-process worker)."""
     if str(meta.get("executor", "")).lower() == "inprocess":
-        return bool(LONG_JOB_WORKER_THREAD and LONG_JOB_WORKER_THREAD.is_alive())
+        return any(t.is_alive() for t in LONG_JOB_WORKER_THREADS)
 
     pid = meta.get("pid")
     if not pid:
@@ -296,8 +302,8 @@ JOB_QUEUE_DISPATCH_LOCK = threading.Lock()
 
 LONG_JOB_QUEUE: queue.Queue[str] = queue.Queue()
 LONG_JOB_CANCEL_EVENTS: Dict[str, threading.Event] = {}
-LONG_JOB_MODEL_CACHE: Dict[Tuple[str, str, str, bool], OmniVoice] = {}
-LONG_JOB_WORKER_THREAD: Optional[threading.Thread] = None
+LONG_JOB_MODEL_CACHE: Dict[Tuple[str, str, str, str, bool], OmniVoice] = {}
+LONG_JOB_WORKER_THREADS: List[threading.Thread] = []
 LONG_JOB_WORKER_LOCK = threading.Lock()
 LONG_JOB_WORKER_RUNNING = threading.Event()
 
@@ -489,11 +495,11 @@ def _long_job_parser_args_from_meta(meta: Dict[str, Any]) -> List[str]:
     return [str(x) for x in cmd[idx + 1 :]]
 
 
-def _get_cached_long_model(args: Any) -> OmniVoice:
+def _get_cached_long_model(args: Any, worker_name: str) -> OmniVoice:
     device = str(args.device or DEFAULT_DEVICE)
     dtype_name = str(args.dtype or DEFAULT_DTYPE)
     load_asr = bool(args.load_asr)
-    key = (str(args.model), device, dtype_name, load_asr)
+    key = (worker_name, str(args.model), device, dtype_name, load_asr)
 
     with LONG_JOB_WORKER_LOCK:
         cached = LONG_JOB_MODEL_CACHE.get(key)
@@ -502,7 +508,8 @@ def _get_cached_long_model(args: Any) -> OmniVoice:
 
     dtype = long_text_cli.resolve_dtype(dtype_name, device)
     logger.info(
-        "[long-worker] loading model cache miss: model=%s device=%s dtype=%s load_asr=%s",
+        "[long-worker] loading model cache miss: worker=%s model=%s device=%s dtype=%s load_asr=%s",
+        worker_name,
         args.model,
         device,
         dtype_name,
@@ -521,7 +528,12 @@ def _get_cached_long_model(args: Any) -> OmniVoice:
     return model
 
 
-def _run_long_job_inprocess(job_id: str, meta: Dict[str, Any], cancel_event: threading.Event) -> None:
+def _run_long_job_inprocess(
+    job_id: str,
+    meta: Dict[str, Any],
+    cancel_event: threading.Event,
+    worker_name: str,
+) -> None:
     parser = long_text_cli.get_parser()
     parser_args = _long_job_parser_args_from_meta(meta)
     args = parser.parse_args(parser_args)
@@ -532,7 +544,7 @@ def _run_long_job_inprocess(job_id: str, meta: Dict[str, Any], cancel_event: thr
     manifest_path = work_dir / "manifest.json"
     manifest = long_text_cli.load_or_create_manifest(args)
 
-    model = _get_cached_long_model(args)
+    model = _get_cached_long_model(args, worker_name=worker_name)
 
     manifest = long_text_cli.render_chunks(model, args, manifest, manifest_path)
     if cancel_event.is_set():
@@ -543,9 +555,10 @@ def _run_long_job_inprocess(job_id: str, meta: Dict[str, Any], cancel_event: thr
         long_text_cli.atomic_write_json(manifest_path, manifest)
 
 
-def _persistent_long_worker_loop() -> None:
+def _persistent_long_worker_loop(worker_index: int) -> None:
     LONG_JOB_WORKER_RUNNING.set()
-    logger.info("[long-worker] started persistent worker loop")
+    worker_name = f"omnivoice-long-worker-{worker_index}"
+    logger.info("[long-worker] started persistent worker loop: %s", worker_name)
 
     while LONG_JOB_WORKER_RUNNING.is_set():
         try:
@@ -570,11 +583,12 @@ def _persistent_long_worker_loop() -> None:
 
         meta["status"] = "running"
         meta["pid"] = os.getpid()
+        meta["worker_name"] = worker_name
         meta["updated_at"] = utc_now()
         write_json(job_meta_path(job_id), meta)
 
         try:
-            _run_long_job_inprocess(job_id, meta, cancel_event)
+            _run_long_job_inprocess(job_id, meta, cancel_event, worker_name=worker_name)
             refreshed = read_json(job_meta_path(job_id))
             if cancel_event.is_set():
                 refreshed["status"] = "cancelled"
@@ -601,17 +615,25 @@ def _persistent_long_worker_loop() -> None:
 
 
 def ensure_persistent_long_worker() -> None:
-    global LONG_JOB_WORKER_THREAD
     with LONG_JOB_WORKER_LOCK:
-        if LONG_JOB_WORKER_THREAD and LONG_JOB_WORKER_THREAD.is_alive():
+        alive_threads = [t for t in LONG_JOB_WORKER_THREADS if t.is_alive()]
+        LONG_JOB_WORKER_THREADS.clear()
+        LONG_JOB_WORKER_THREADS.extend(alive_threads)
+
+        target_size = max(1, DEFAULT_LONG_WORKER_POOL_SIZE)
+        if len(LONG_JOB_WORKER_THREADS) >= target_size:
             return
+
         LONG_JOB_WORKER_RUNNING.set()
-        LONG_JOB_WORKER_THREAD = threading.Thread(
-            target=_persistent_long_worker_loop,
-            name="omnivoice-long-worker",
-            daemon=True,
-        )
-        LONG_JOB_WORKER_THREAD.start()
+        for i in range(len(LONG_JOB_WORKER_THREADS), target_size):
+            t = threading.Thread(
+                target=_persistent_long_worker_loop,
+                args=(i + 1,),
+                name=f"omnivoice-long-worker-{i + 1}",
+                daemon=True,
+            )
+            LONG_JOB_WORKER_THREADS.append(t)
+            t.start()
 
 
 def _collect_jobs(user_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -726,6 +748,8 @@ def health() -> Dict[str, Any]:
         "model_loaded": _model is not None,
         "anti_spam_version": "guard-atomic-v1",
         "max_concurrent_long_jobs": MAX_CONCURRENT_LONG_JOBS,
+        "long_worker_pool_size": DEFAULT_LONG_WORKER_POOL_SIZE,
+        "long_worker_alive": sum(1 for t in LONG_JOB_WORKER_THREADS if t.is_alive()),
         "chunk_workers": DEFAULT_CHUNK_WORKERS,
         "chunk_retries": DEFAULT_CHUNK_RETRIES,
         "chunk_retry_delay": DEFAULT_CHUNK_RETRY_DELAY,

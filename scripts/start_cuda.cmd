@@ -27,6 +27,7 @@ if not defined FRONTEND_HOST set "FRONTEND_HOST=127.0.0.1"
 if not defined FRONTEND_PORT set "FRONTEND_PORT=5173"
 if not defined OMNIVOICE_DTYPE set "OMNIVOICE_DTYPE=auto"
 if not defined OMNIVOICE_MAX_CONCURRENT_LONG_JOBS set "OMNIVOICE_MAX_CONCURRENT_LONG_JOBS=3"
+if not defined OMNIVOICE_LONG_WORKER_POOL_SIZE set "OMNIVOICE_LONG_WORKER_POOL_SIZE=2"
 if not defined OMNIVOICE_CHUNK_WORKERS set "OMNIVOICE_CHUNK_WORKERS=1"
 if not defined HF_HUB_ENABLE_HF_TRANSFER set "HF_HUB_ENABLE_HF_TRANSFER=1"
 if not defined CHECK_CUDA set "CHECK_CUDA=1"
@@ -42,6 +43,7 @@ echo [INFO] ROOT_DIR=%CD%
 echo [INFO] OMNIVOICE_DEVICE=%OMNIVOICE_DEVICE%
 echo [INFO] OMNIVOICE_DTYPE=%OMNIVOICE_DTYPE%
 echo [INFO] OMNIVOICE_MAX_CONCURRENT_LONG_JOBS=%OMNIVOICE_MAX_CONCURRENT_LONG_JOBS%
+echo [INFO] OMNIVOICE_LONG_WORKER_POOL_SIZE=%OMNIVOICE_LONG_WORKER_POOL_SIZE%
 echo [INFO] OMNIVOICE_CHUNK_WORKERS=%OMNIVOICE_CHUNK_WORKERS%
 echo [INFO] BACKEND_WAIT_TIMEOUT=%BACKEND_WAIT_TIMEOUT%s
 echo [INFO] ENABLE_CLOUDFLARE_TUNNEL=%ENABLE_CLOUDFLARE_TUNNEL%
@@ -95,7 +97,7 @@ if "%DRY_RUN%"=="1" (
 )
 
 echo [STEP] Starting backend with CUDA on %BACKEND_HOST%:%BACKEND_PORT% ...
-start "OmniVoice API CUDA" /D "%CD%" cmd /k "set HF_HUB_ENABLE_HF_TRANSFER=%HF_HUB_ENABLE_HF_TRANSFER% && set OMNIVOICE_DEVICE=cuda && set OMNIVOICE_DTYPE=%OMNIVOICE_DTYPE% && set OMNIVOICE_MAX_CONCURRENT_LONG_JOBS=%OMNIVOICE_MAX_CONCURRENT_LONG_JOBS% && set OMNIVOICE_CHUNK_WORKERS=%OMNIVOICE_CHUNK_WORKERS% && .venv\Scripts\python.exe -m uvicorn server.api:app --host %BACKEND_HOST% --port %BACKEND_PORT% --reload"
+start "OmniVoice API CUDA" /D "%CD%" cmd /k "set HF_HUB_ENABLE_HF_TRANSFER=%HF_HUB_ENABLE_HF_TRANSFER% && set OMNIVOICE_DEVICE=cuda && set OMNIVOICE_DTYPE=%OMNIVOICE_DTYPE% && set OMNIVOICE_MAX_CONCURRENT_LONG_JOBS=%OMNIVOICE_MAX_CONCURRENT_LONG_JOBS% && set OMNIVOICE_LONG_WORKER_POOL_SIZE=%OMNIVOICE_LONG_WORKER_POOL_SIZE% && set OMNIVOICE_CHUNK_WORKERS=%OMNIVOICE_CHUNK_WORKERS% && .venv\Scripts\python.exe -m uvicorn server.api:app --host %BACKEND_HOST% --port %BACKEND_PORT% --reload"
 
 echo [STEP] Waiting for backend health before starting frontend...
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='SilentlyContinue'; $timeout=[int]$env:BACKEND_WAIT_TIMEOUT; $url='http://' + $env:BACKEND_HOST + ':' + $env:BACKEND_PORT + '/api/health'; $deadline=(Get-Date).AddSeconds($timeout); Write-Host ('[INFO] Health URL: ' + $url); while((Get-Date) -lt $deadline){ try { $r=Invoke-WebRequest -UseBasicParsing -Uri $url -TimeoutSec 2; if($r.StatusCode -ge 200 -and $r.StatusCode -lt 300){ Write-Host '[OK] Backend is ready.'; exit 0 } } catch { Write-Host '[WAIT] Backend is not ready yet...'; Start-Sleep -Seconds 2 } }; Write-Host ('[ERROR] Backend did not become ready within ' + $timeout + ' seconds.'); exit 1"
