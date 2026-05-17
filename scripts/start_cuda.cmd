@@ -10,6 +10,7 @@ rem   set FRONTEND_PORT=5173
 rem   set OMNIVOICE_DTYPE=auto
 rem   set CHECK_CUDA=0
 rem   set DRY_RUN=1
+rem   set BACKEND_WAIT_TIMEOUT=180
 
 cd /d "%~dp0\.."
 if errorlevel 1 (
@@ -26,6 +27,7 @@ if not defined OMNIVOICE_MAX_CONCURRENT_LONG_JOBS set "OMNIVOICE_MAX_CONCURRENT_
 if not defined HF_HUB_ENABLE_HF_TRANSFER set "HF_HUB_ENABLE_HF_TRANSFER=1"
 if not defined CHECK_CUDA set "CHECK_CUDA=1"
 if not defined DRY_RUN set "DRY_RUN=0"
+if not defined BACKEND_WAIT_TIMEOUT set "BACKEND_WAIT_TIMEOUT=180"
 
 rem Force CUDA for backend/model loading.
 set "OMNIVOICE_DEVICE=cuda"
@@ -34,6 +36,7 @@ echo [INFO] ROOT_DIR=%CD%
 echo [INFO] OMNIVOICE_DEVICE=%OMNIVOICE_DEVICE%
 echo [INFO] OMNIVOICE_DTYPE=%OMNIVOICE_DTYPE%
 echo [INFO] OMNIVOICE_MAX_CONCURRENT_LONG_JOBS=%OMNIVOICE_MAX_CONCURRENT_LONG_JOBS%
+echo [INFO] BACKEND_WAIT_TIMEOUT=%BACKEND_WAIT_TIMEOUT%s
 
 if not exist ".venv\Scripts\python.exe" (
   echo [ERROR] .venv was not found.
@@ -85,6 +88,14 @@ if "%DRY_RUN%"=="1" (
 
 echo [STEP] Starting backend with CUDA on %BACKEND_HOST%:%BACKEND_PORT% ...
 start "OmniVoice API CUDA" /D "%CD%" cmd /k "set HF_HUB_ENABLE_HF_TRANSFER=%HF_HUB_ENABLE_HF_TRANSFER% && set OMNIVOICE_DEVICE=cuda && set OMNIVOICE_DTYPE=%OMNIVOICE_DTYPE% && set OMNIVOICE_MAX_CONCURRENT_LONG_JOBS=%OMNIVOICE_MAX_CONCURRENT_LONG_JOBS% && .venv\Scripts\python.exe -m uvicorn server.api:app --host %BACKEND_HOST% --port %BACKEND_PORT% --reload"
+
+echo [STEP] Waiting for backend health before starting frontend...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='SilentlyContinue'; $timeout=[int]$env:BACKEND_WAIT_TIMEOUT; $url='http://' + $env:BACKEND_HOST + ':' + $env:BACKEND_PORT + '/api/health'; $deadline=(Get-Date).AddSeconds($timeout); Write-Host ('[INFO] Health URL: ' + $url); while((Get-Date) -lt $deadline){ try { $r=Invoke-WebRequest -UseBasicParsing -Uri $url -TimeoutSec 2; if($r.StatusCode -ge 200 -and $r.StatusCode -lt 300){ Write-Host '[OK] Backend is ready.'; exit 0 } } catch { Write-Host '[WAIT] Backend is not ready yet...'; Start-Sleep -Seconds 2 } }; Write-Host ('[ERROR] Backend did not become ready within ' + $timeout + ' seconds.'); exit 1"
+if errorlevel 1 (
+  echo [ERROR] Frontend will not start because backend health check failed.
+  echo [HINT] Check the "OmniVoice API CUDA" window for backend error logs.
+  exit /b 1
+)
 
 echo [STEP] Starting frontend on %FRONTEND_HOST%:%FRONTEND_PORT% ...
 start "OmniVoice Frontend" /D "%CD%\frontend" cmd /k "npm run dev -- --host %FRONTEND_HOST% --port %FRONTEND_PORT%"
