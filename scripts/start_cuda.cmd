@@ -12,6 +12,8 @@ rem   set CHECK_CUDA=0
 rem   set DRY_RUN=1
 rem   set BACKEND_WAIT_TIMEOUT=180
 rem   set OMNIVOICE_CHUNK_WORKERS=2
+rem   set ENABLE_CLOUDFLARE_TUNNEL=1
+rem   set CLOUDFLARE_TUNNEL_TIMEOUT=30
 
 cd /d "%~dp0\.."
 if errorlevel 1 (
@@ -30,6 +32,8 @@ if not defined HF_HUB_ENABLE_HF_TRANSFER set "HF_HUB_ENABLE_HF_TRANSFER=1"
 if not defined CHECK_CUDA set "CHECK_CUDA=1"
 if not defined DRY_RUN set "DRY_RUN=0"
 if not defined BACKEND_WAIT_TIMEOUT set "BACKEND_WAIT_TIMEOUT=180"
+if not defined ENABLE_CLOUDFLARE_TUNNEL set "ENABLE_CLOUDFLARE_TUNNEL=0"
+if not defined CLOUDFLARE_TUNNEL_TIMEOUT set "CLOUDFLARE_TUNNEL_TIMEOUT=30"
 
 rem Force CUDA for backend/model loading.
 set "OMNIVOICE_DEVICE=cuda"
@@ -40,6 +44,7 @@ echo [INFO] OMNIVOICE_DTYPE=%OMNIVOICE_DTYPE%
 echo [INFO] OMNIVOICE_MAX_CONCURRENT_LONG_JOBS=%OMNIVOICE_MAX_CONCURRENT_LONG_JOBS%
 echo [INFO] OMNIVOICE_CHUNK_WORKERS=%OMNIVOICE_CHUNK_WORKERS%
 echo [INFO] BACKEND_WAIT_TIMEOUT=%BACKEND_WAIT_TIMEOUT%s
+echo [INFO] ENABLE_CLOUDFLARE_TUNNEL=%ENABLE_CLOUDFLARE_TUNNEL%
 
 if not exist ".venv\Scripts\python.exe" (
   echo [ERROR] .venv was not found.
@@ -103,9 +108,34 @@ if errorlevel 1 (
 echo [STEP] Starting frontend on %FRONTEND_HOST%:%FRONTEND_PORT% ...
 start "OmniVoice Frontend" /D "%CD%\frontend" cmd /k "npm run dev -- --host %FRONTEND_HOST% --port %FRONTEND_PORT%"
 
+if "%ENABLE_CLOUDFLARE_TUNNEL%"=="1" call :start_cloudflare_tunnels
+
 echo.
 echo [OK] Started backend with CUDA and frontend in separate terminal windows.
 echo [OK] Frontend: http://127.0.0.1:%FRONTEND_PORT%
 echo [OK] API health: http://127.0.0.1:%BACKEND_PORT%/api/health
 echo [INFO] Backend env: OMNIVOICE_DEVICE=cuda, OMNIVOICE_DTYPE=%OMNIVOICE_DTYPE%, OMNIVOICE_CHUNK_WORKERS=%OMNIVOICE_CHUNK_WORKERS%
+if not "%ENABLE_CLOUDFLARE_TUNNEL%"=="1" echo [INFO] Public URL: set ENABLE_CLOUDFLARE_TUNNEL=1 ^&^& scripts\start_cuda.cmd
+exit /b 0
+
+:start_cloudflare_tunnels
+where cloudflared >nul 2>nul
+if errorlevel 1 (
+  echo [INFO] cloudflared was not found. Downloading cloudflared for Windows amd64...
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; New-Item -ItemType Directory -Force -Path '.tools' | Out-Null; Invoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -OutFile '.tools\cloudflared.exe'"
+  if errorlevel 1 (
+    echo [WARN] Could not download cloudflared. Skip public URL.
+    exit /b 0
+  )
+  set "PATH=%CD%\.tools;%PATH%"
+)
+
+echo [STEP] Starting Cloudflare tunnel for API...
+start "OmniVoice CF API" /D "%CD%" cmd /k "cloudflared tunnel --url http://%BACKEND_HOST%:%BACKEND_PORT%"
+
+echo [STEP] Starting Cloudflare tunnel for Frontend...
+start "OmniVoice CF Frontend" /D "%CD%" cmd /k "cloudflared tunnel --url http://%FRONTEND_HOST%:%FRONTEND_PORT%"
+
+echo [INFO] Cloudflare windows opened: OmniVoice CF API / OmniVoice CF Frontend
+echo [INFO] Copy URL https://*.trycloudflare.com shown in each window.
 exit /b 0
