@@ -37,6 +37,7 @@ const DEFAULT_SETTINGS: SettingsState = {
   guidance_scale: '2.0',
   speed: '1.0',
   pause_scale: '1.0',
+  chunk_workers: '1',
   comma_pause: '0.18',
   sentence_pause: '0.45',
   paragraph_pause: '0.75',
@@ -549,7 +550,7 @@ export default function App() {
             <b>{health?.ok ? 'API online' : 'API offline'}</b>
             <small>
               {health
-                ? `${health.device} · ${health.dtype} · Running ${health.running_long_jobs ?? 0}/${health.max_concurrent_long_jobs ?? 0} · Queue ${health.queued_long_jobs ?? 0}`
+                ? `${health.device} · ${health.dtype} · Jobs ${health.running_long_jobs ?? 0}/${health.max_concurrent_long_jobs ?? 0} · Chunk workers ${health.chunk_workers ?? settings.chunk_workers ?? 1} · Queue ${health.queued_long_jobs ?? 0}`
                 : 'Không kết nối'}
             </small>
           </div>
@@ -768,6 +769,17 @@ export default function App() {
               </label>
               <label>Pause scale
                 <input type="number" step="0.05" value={String(settings.pause_scale)} onChange={(e) => setSettings({ pause_scale: e.target.value })} />
+              </label>
+              <label>Chunk workers
+                <input
+                  type="number"
+                  min="1"
+                  max="8"
+                  step="1"
+                  value={String(settings.chunk_workers)}
+                  onChange={(e) => setSettings({ chunk_workers: e.target.value })}
+                />
+                <small>Render nhiều chunk song song trong 1 kịch bản. GPU 16GB nên thử 2 trước.</small>
               </label>
             </div>
             <div className="group checks">

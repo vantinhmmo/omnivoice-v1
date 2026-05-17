@@ -6,6 +6,7 @@ export type Health = {
   cuda: boolean;
   model_loaded: boolean;
   max_concurrent_long_jobs?: number;
+  chunk_workers?: number;
   running_long_jobs?: number;
   queued_long_jobs?: number;
   active_long_jobs?: number;
@@ -20,6 +21,7 @@ export type JobSummary = {
   total_elapsed?: number;
   average_rtf?: number | null;
   final_status?: string;
+  chunk_workers?: number;
   final_output?: string;
   final_size_bytes?: number;
   inserted_pause_duration?: number;

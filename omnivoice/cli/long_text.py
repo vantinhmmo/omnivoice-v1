@@ -34,10 +34,12 @@ import re
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+import threading
 
 import numpy as np
 import soundfile as sf
@@ -83,6 +85,20 @@ def get_best_device() -> str:
     if torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def positive_int(value: str) -> int:
+    parsed = int(str(value).strip())
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be >= 1")
+    return parsed
+
+
+def env_positive_int(name: str, default: int) -> int:
+    try:
+        return positive_int(os.environ.get(name, str(default)))
+    except Exception:
+        return default
 
 
 def resolve_dtype(dtype_name: str, device: str) -> torch.dtype:
@@ -267,6 +283,7 @@ def make_manifest(
             "audio_chunk_duration": args.audio_chunk_duration,
             "audio_chunk_threshold": args.audio_chunk_threshold,
             "speed": args.speed,
+            "chunk_workers": args.chunk_workers,
         },
         "split": {
             "max_chars": args.max_chars,
@@ -438,6 +455,8 @@ def render_chunks(
     manifest_path: Path,
 ) -> Dict[str, Any]:
     gen_config = build_generation_config(args)
+    chunk_workers = max(1, int(getattr(args, "chunk_workers", 1) or 1))
+    manifest_lock = threading.Lock()
 
     voice_clone_prompt = None
     if args.ref_audio:
@@ -449,14 +468,17 @@ def render_chunks(
         )
         logger.info("Voice clone prompt is ready.")
 
-    total = len(manifest["chunks"])
-    for record in manifest["chunks"]:
+    def write_manifest_locked() -> None:
+        update_manifest_summary(manifest)
+        atomic_write_json(manifest_path, manifest)
+
+    def render_one_record(record: Dict[str, Any], total: int) -> None:
         idx = int(record["idx"])
         wav_path = Path(record["wav"])
 
         if should_skip_chunk(record, args.force):
             logger.info("[%d/%d] Skip existing chunk: %s", idx + 1, total, wav_path)
-            continue
+            return
 
         logger.info(
             "[%d/%d] Rendering %d chars -> %s",
@@ -467,11 +489,11 @@ def render_chunks(
         )
 
         start = time.time()
-        record["status"] = "running"
-        record["error"] = None
-        record["updated_at"] = utc_now()
-        update_manifest_summary(manifest)
-        atomic_write_json(manifest_path, manifest)
+        with manifest_lock:
+            record["status"] = "running"
+            record["error"] = None
+            record["updated_at"] = utc_now()
+            write_manifest_locked()
 
         try:
             generation_kwargs: Dict[str, Any] = {
@@ -494,11 +516,13 @@ def render_chunks(
             duration = float(audio.shape[-1]) / float(model.sampling_rate)
             save_audio_atomic(wav_path, audio, model.sampling_rate)
 
-            record["status"] = "done"
-            record["duration"] = duration
-            record["elapsed"] = elapsed
-            record["error"] = None
-            record["updated_at"] = utc_now()
+            with manifest_lock:
+                record["status"] = "done"
+                record["duration"] = duration
+                record["elapsed"] = elapsed
+                record["error"] = None
+                record["updated_at"] = utc_now()
+                write_manifest_locked()
             logger.info(
                 "[%d/%d] Done: duration=%.2fs elapsed=%.2fs rtf=%.3f",
                 idx + 1,
@@ -508,20 +532,58 @@ def render_chunks(
                 elapsed / duration if duration > 0 else float("inf"),
             )
         except Exception as e:
-            record["status"] = "failed"
-            record["elapsed"] = time.time() - start
-            record["error"] = f"{type(e).__name__}: {e}"
-            record["updated_at"] = utc_now()
+            with manifest_lock:
+                record["status"] = "failed"
+                record["elapsed"] = time.time() - start
+                record["error"] = f"{type(e).__name__}: {e}"
+                record["updated_at"] = utc_now()
+                write_manifest_locked()
             logger.exception("[%d/%d] Failed", idx + 1, total)
-            update_manifest_summary(manifest)
-            atomic_write_json(manifest_path, manifest)
             if not args.continue_on_error:
                 raise
         finally:
             clear_device_cache()
-            update_manifest_summary(manifest)
-            atomic_write_json(manifest_path, manifest)
 
+    total = len(manifest["chunks"])
+    pending_records = [
+        record
+        for record in manifest["chunks"]
+        if not should_skip_chunk(record, args.force)
+    ]
+
+    if not pending_records:
+        logger.info("All chunks are already done. Nothing to render.")
+        with manifest_lock:
+            write_manifest_locked()
+        return manifest
+
+    if chunk_workers == 1:
+        logger.info("Rendering chunks sequentially: workers=1")
+        for record in manifest["chunks"]:
+            render_one_record(record, total)
+        return manifest
+
+    logger.warning(
+        "Rendering chunks in parallel with %d threads in one process. "
+        "This is experimental and may increase VRAM usage or expose model thread-safety issues.",
+        chunk_workers,
+    )
+    with ThreadPoolExecutor(max_workers=chunk_workers) as executor:
+        future_to_record = {
+            executor.submit(render_one_record, record, total): record
+            for record in pending_records
+        }
+        for future in as_completed(future_to_record):
+            try:
+                future.result()
+            except Exception:
+                if not args.continue_on_error:
+                    for pending in future_to_record:
+                        pending.cancel()
+                    raise
+
+    with manifest_lock:
+        write_manifest_locked()
     return manifest
 
 
@@ -751,6 +813,15 @@ def get_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--wav_subtype", default="PCM_16")
     parser.add_argument("--audio_bitrate", default="192k")
+    parser.add_argument(
+        "--chunk_workers",
+        type=positive_int,
+        default=env_positive_int("OMNIVOICE_CHUNK_WORKERS", 1),
+        help=(
+            "Number of chunks to render concurrently inside one long-text job. "
+            "Experimental; increase only if GPU VRAM is sufficient."
+        ),
+    )
 
     return parser
 

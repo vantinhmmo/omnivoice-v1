@@ -42,6 +42,10 @@ SHORT_DIR = ROOT_DIR / "outputs" / "short"
 DEFAULT_MODEL = os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice").strip()
 DEFAULT_DEVICE = os.environ.get("OMNIVOICE_DEVICE", "cuda" if torch.cuda.is_available() else "cpu").strip()
 DEFAULT_DTYPE = os.environ.get("OMNIVOICE_DTYPE", "auto").strip().lower()
+try:
+    DEFAULT_CHUNK_WORKERS = max(1, int(os.environ.get("OMNIVOICE_CHUNK_WORKERS", "1").strip()))
+except ValueError:
+    DEFAULT_CHUNK_WORKERS = 1
 RESET_JOBS_ON_START = str2bool(os.environ.get("OMNIVOICE_RESET_JOBS_ON_START", "true"))
 
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
@@ -568,6 +572,7 @@ def health() -> Dict[str, Any]:
         "model_loaded": _model is not None,
         "anti_spam_version": "guard-atomic-v1",
         "max_concurrent_long_jobs": MAX_CONCURRENT_LONG_JOBS,
+        "chunk_workers": DEFAULT_CHUNK_WORKERS,
         **queue_stats,
     }
 
@@ -665,6 +670,7 @@ async def create_long_job(
     sentence_pause: float = Form(0.45),
     paragraph_pause: float = Form(0.75),
     postprocess_output: bool = Form(True),
+    chunk_workers: Optional[int] = Form(None),
 ) -> Dict[str, Any]:
     if not script_text and (script_file is None or not script_file.filename):
         raise HTTPException(status_code=400, detail="script_text or script_file is required")
@@ -682,6 +688,7 @@ async def create_long_job(
             script_path.write_text(script_text or "", encoding="utf-8")
 
         ref_path = await save_upload(ref_audio, jdir / "reference.wav")
+        job_chunk_workers = max(1, int(chunk_workers or DEFAULT_CHUNK_WORKERS))
         output_ext = "mp3" if output_format.lower() == "mp3" else "wav"
         output_path = jdir / f"final.{output_ext}"
         work_dir = jdir / "work"
@@ -725,6 +732,8 @@ async def create_long_job(
             DEFAULT_DEVICE,
             "--dtype",
             DEFAULT_DTYPE,
+            "--chunk_workers",
+            str(job_chunk_workers),
             "--resume",
             "true",
         ]
@@ -747,6 +756,7 @@ async def create_long_job(
             "output": str(output_path),
             "work_dir": str(work_dir),
             "log": str(log_path),
+            "chunk_workers": job_chunk_workers,
             "command": cmd,
         }
         write_json(job_meta_path(job_id), meta)
