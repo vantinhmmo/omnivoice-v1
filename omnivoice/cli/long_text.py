@@ -74,6 +74,10 @@ class ChunkRecord:
     updated_at: Optional[str] = None
 
 
+class CancelledByUser(Exception):
+    """Raised when the current long-text job is cancelled by user request."""
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -493,6 +497,10 @@ def render_chunks(
     chunk_retries = max(0, int(getattr(args, "chunk_retries", 0) or 0))
     chunk_retry_delay = max(0.0, float(getattr(args, "chunk_retry_delay", 0.0) or 0.0))
     manifest_lock = threading.Lock()
+    cancel_event = getattr(args, "cancel_event", None)
+
+    def is_cancelled() -> bool:
+        return bool(cancel_event is not None and cancel_event.is_set())
 
     voice_clone_prompt = None
     if args.ref_audio:
@@ -516,6 +524,14 @@ def render_chunks(
             logger.info("[%d/%d] Skip existing chunk: %s", idx + 1, total, wav_path)
             return
 
+        if is_cancelled():
+            with manifest_lock:
+                record["status"] = "cancelled"
+                record["error"] = "Cancelled by user"
+                record["updated_at"] = utc_now()
+                write_manifest_locked()
+            raise CancelledByUser("Cancelled by user")
+
         logger.info(
             "[%d/%d] Rendering %d chars -> %s",
             idx + 1,
@@ -530,6 +546,16 @@ def render_chunks(
 
         for attempt in range(1, max_attempts + 1):
             attempt_start = time.time()
+            if is_cancelled():
+                with manifest_lock:
+                    record["status"] = "cancelled"
+                    record["attempt"] = attempt
+                    record["max_attempts"] = max_attempts
+                    record["error"] = "Cancelled by user"
+                    record["updated_at"] = utc_now()
+                    write_manifest_locked()
+                raise CancelledByUser("Cancelled by user")
+
             with manifest_lock:
                 record["status"] = "running"
                 record["attempt"] = attempt
@@ -559,6 +585,9 @@ def render_chunks(
                     attempt,
                     max_attempts,
                 )
+                if is_cancelled():
+                    raise CancelledByUser("Cancelled by user")
+
                 with torch.inference_mode():
                     audio = model.generate(**generation_kwargs)[0]
 
@@ -586,6 +615,17 @@ def render_chunks(
                     max_attempts,
                 )
                 return
+            except CancelledByUser:
+                with manifest_lock:
+                    record["status"] = "cancelled"
+                    record["elapsed"] = time.time() - total_start
+                    record["attempt"] = attempt
+                    record["max_attempts"] = max_attempts
+                    record["error"] = "Cancelled by user"
+                    record["updated_at"] = utc_now()
+                    write_manifest_locked()
+                logger.info("[%d/%d] Cancelled by user", idx + 1, total)
+                raise
             except Exception as e:
                 last_error = e
                 clear_device_cache()
@@ -609,6 +649,8 @@ def render_chunks(
                     attempt_elapsed,
                 )
                 if should_retry:
+                    if is_cancelled():
+                        raise CancelledByUser("Cancelled by user")
                     if chunk_retry_delay > 0:
                         time.sleep(chunk_retry_delay)
                     continue

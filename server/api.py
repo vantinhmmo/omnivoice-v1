@@ -22,9 +22,10 @@ import subprocess
 import sys
 import threading
 import uuid
+import queue
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -34,7 +35,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
-from omnivoice.utils.common import str2bool
+from omnivoice.cli import long_text as long_text_cli
+from omnivoice.utils.common import str2bool, fix_random_seed
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 JOBS_DIR = ROOT_DIR / "jobs"
@@ -89,6 +91,12 @@ def clear_job_metadata_on_startup() -> None:
 def on_startup_reset_jobs() -> None:
     if RESET_JOBS_ON_START:
         clear_job_metadata_on_startup()
+    ensure_persistent_long_worker()
+
+
+@app.on_event("shutdown")
+def on_shutdown_long_worker() -> None:
+    LONG_JOB_WORKER_RUNNING.clear()
 
 
 def utc_now() -> str:
@@ -204,7 +212,10 @@ def is_pid_running(pid: Optional[int]) -> bool:
 
 
 def is_job_process_running(meta: Dict[str, Any]) -> bool:
-    """Check running state by PID + command line fingerprint to avoid PID reuse false positives."""
+    """Check running state for long jobs (subprocess or in-process worker)."""
+    if str(meta.get("executor", "")).lower() == "inprocess":
+        return bool(LONG_JOB_WORKER_THREAD and LONG_JOB_WORKER_THREAD.is_alive())
+
     pid = meta.get("pid")
     if not pid:
         return False
@@ -282,6 +293,13 @@ JOB_SUBMIT_LOCK = JOBS_DIR / ".create_job.lock"
 SINGLE_ACTIVE_GUARD = JOBS_DIR / ".single_active_guard"
 JOB_SUBMIT_ASYNC_LOCK = asyncio.Lock()
 JOB_QUEUE_DISPATCH_LOCK = threading.Lock()
+
+LONG_JOB_QUEUE: queue.Queue[str] = queue.Queue()
+LONG_JOB_CANCEL_EVENTS: Dict[str, threading.Event] = {}
+LONG_JOB_MODEL_CACHE: Dict[Tuple[str, str, str, bool], OmniVoice] = {}
+LONG_JOB_WORKER_THREAD: Optional[threading.Thread] = None
+LONG_JOB_WORKER_LOCK = threading.Lock()
+LONG_JOB_WORKER_RUNNING = threading.Event()
 
 
 def find_active_long_job() -> Optional[Dict[str, Any]]:
@@ -461,6 +479,141 @@ def _sort_jobs_by_time_desc(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return jobs
 
 
+def _long_job_parser_args_from_meta(meta: Dict[str, Any]) -> List[str]:
+    cmd = meta.get("command") or []
+    if not isinstance(cmd, list):
+        raise ValueError("Invalid command format")
+    if "omnivoice.cli.long_text" not in cmd:
+        raise ValueError("Long-text command module is missing")
+    idx = cmd.index("omnivoice.cli.long_text")
+    return [str(x) for x in cmd[idx + 1 :]]
+
+
+def _get_cached_long_model(args: Any) -> OmniVoice:
+    device = str(args.device or DEFAULT_DEVICE)
+    dtype_name = str(args.dtype or DEFAULT_DTYPE)
+    load_asr = bool(args.load_asr)
+    key = (str(args.model), device, dtype_name, load_asr)
+
+    with LONG_JOB_WORKER_LOCK:
+        cached = LONG_JOB_MODEL_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+    dtype = long_text_cli.resolve_dtype(dtype_name, device)
+    logger.info(
+        "[long-worker] loading model cache miss: model=%s device=%s dtype=%s load_asr=%s",
+        args.model,
+        device,
+        dtype_name,
+        load_asr,
+    )
+    model = OmniVoice.from_pretrained(
+        args.model,
+        device_map=device,
+        dtype=dtype,
+        load_asr=load_asr,
+    )
+    model.eval()
+
+    with LONG_JOB_WORKER_LOCK:
+        LONG_JOB_MODEL_CACHE[key] = model
+    return model
+
+
+def _run_long_job_inprocess(job_id: str, meta: Dict[str, Any], cancel_event: threading.Event) -> None:
+    parser = long_text_cli.get_parser()
+    parser_args = _long_job_parser_args_from_meta(meta)
+    args = parser.parse_args(parser_args)
+    setattr(args, "cancel_event", cancel_event)
+
+    fix_random_seed(args.seed)
+    work_dir = Path(args.work_dir)
+    manifest_path = work_dir / "manifest.json"
+    manifest = long_text_cli.load_or_create_manifest(args)
+
+    model = _get_cached_long_model(args)
+
+    manifest = long_text_cli.render_chunks(model, args, manifest, manifest_path)
+    if cancel_event.is_set():
+        raise RuntimeError("Cancelled by user")
+
+    if args.merge:
+        long_text_cli.merge_final_audio(args, manifest)
+        long_text_cli.atomic_write_json(manifest_path, manifest)
+
+
+def _persistent_long_worker_loop() -> None:
+    LONG_JOB_WORKER_RUNNING.set()
+    logger.info("[long-worker] started persistent worker loop")
+
+    while LONG_JOB_WORKER_RUNNING.is_set():
+        try:
+            job_id = LONG_JOB_QUEUE.get(timeout=0.5)
+        except queue.Empty:
+            continue
+
+        if not job_id:
+            continue
+
+        try:
+            meta = read_json(job_meta_path(job_id))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[long-worker] cannot read job meta id=%s error=%s", job_id, exc)
+            continue
+
+        status = str(meta.get("status", "")).lower()
+        if status in {"cancelled", "done", "failed", "stopped", "merged"}:
+            continue
+
+        cancel_event = LONG_JOB_CANCEL_EVENTS.setdefault(job_id, threading.Event())
+
+        meta["status"] = "running"
+        meta["pid"] = os.getpid()
+        meta["updated_at"] = utc_now()
+        write_json(job_meta_path(job_id), meta)
+
+        try:
+            _run_long_job_inprocess(job_id, meta, cancel_event)
+            refreshed = read_json(job_meta_path(job_id))
+            if cancel_event.is_set():
+                refreshed["status"] = "cancelled"
+            elif Path(refreshed.get("output", "")).exists():
+                refreshed["status"] = "done"
+            else:
+                refreshed["status"] = "stopped"
+            refreshed["updated_at"] = utc_now()
+            write_json(job_meta_path(job_id), refreshed)
+        except Exception as exc:  # noqa: BLE001
+            refreshed = read_json(job_meta_path(job_id))
+            if cancel_event.is_set() or "cancel" in str(exc).lower():
+                refreshed["status"] = "cancelled"
+                refreshed["error"] = "Cancelled by user"
+            else:
+                refreshed["status"] = "failed"
+                refreshed["error"] = str(exc)
+            refreshed["updated_at"] = utc_now()
+            write_json(job_meta_path(job_id), refreshed)
+            logger.exception("[long-worker] job failed id=%s", job_id)
+        finally:
+            LONG_JOB_CANCEL_EVENTS.pop(job_id, None)
+            dispatch_next_queued_job()
+
+
+def ensure_persistent_long_worker() -> None:
+    global LONG_JOB_WORKER_THREAD
+    with LONG_JOB_WORKER_LOCK:
+        if LONG_JOB_WORKER_THREAD and LONG_JOB_WORKER_THREAD.is_alive():
+            return
+        LONG_JOB_WORKER_RUNNING.set()
+        LONG_JOB_WORKER_THREAD = threading.Thread(
+            target=_persistent_long_worker_loop,
+            name="omnivoice-long-worker",
+            daemon=True,
+        )
+        LONG_JOB_WORKER_THREAD.start()
+
+
 def _collect_jobs(user_id: Optional[str] = None) -> List[Dict[str, Any]]:
     jobs: List[Dict[str, Any]] = []
     requested_user = normalize_user_id(user_id) if user_id is not None else None
@@ -477,7 +630,9 @@ def _collect_jobs(user_id: Optional[str] = None) -> List[Dict[str, Any]]:
 
 
 def dispatch_next_queued_job() -> Optional[Dict[str, Any]]:
-    """Dispatch queued jobs up to MAX_CONCURRENT_LONG_JOBS."""
+    """Dispatch queued jobs into persistent in-process worker queue."""
+    ensure_persistent_long_worker()
+
     with JOB_QUEUE_DISPATCH_LOCK:
         candidates: List[Dict[str, Any]] = []
         running_count = 0
@@ -486,9 +641,9 @@ def dispatch_next_queued_job() -> Optional[Dict[str, Any]]:
             try:
                 meta = refresh_job_status(read_json(path))
                 status = str(meta.get("status", "")).lower()
-                if status == "running":
+                if status in {"running", "pending"}:
                     running_count += 1
-                elif status in {"queued", "pending"}:
+                elif status == "queued":
                     candidates.append(meta)
             except Exception:  # noqa: BLE001
                 continue
@@ -514,27 +669,18 @@ def dispatch_next_queued_job() -> Optional[Dict[str, Any]]:
                 dispatched.append(read_job(job_id))
                 continue
 
-            log_path = Path(meta.get("log") or (job_dir(job_id) / "worker.log"))
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-
-            with log_path.open("ab") as log_file:
-                process = subprocess.Popen(
-                    cmd,
-                    cwd=str(ROOT_DIR),
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
-                    start_new_session=os.name != "nt",
-                )
-
-            meta["status"] = "running"
-            meta["pid"] = process.pid
+            meta["status"] = "pending"
+            meta["pid"] = os.getpid()
+            meta["executor"] = "inprocess"
             meta["updated_at"] = utc_now()
             write_json(job_meta_path(job_id), meta)
+
+            LONG_JOB_CANCEL_EVENTS.setdefault(job_id, threading.Event())
+            LONG_JOB_QUEUE.put(job_id)
+
             logger.info(
-                "[queue] dispatched job: id=%s pid=%s running=%s/%s",
+                "[queue] enqueued job into persistent worker: id=%s pending=%s/%s",
                 job_id,
-                process.pid,
                 running_count + len(dispatched) + 1,
                 MAX_CONCURRENT_LONG_JOBS,
             )
@@ -777,6 +923,7 @@ async def create_long_job(
             "chunk_workers": job_chunk_workers,
             "chunk_retries": job_chunk_retries,
             "chunk_retry_delay": job_chunk_retry_delay,
+            "executor": "inprocess",
             "command": cmd,
         }
         write_json(job_meta_path(job_id), meta)
@@ -808,47 +955,16 @@ def cancel_job(job_id: str, user_id: Optional[str] = Query(None)) -> Dict[str, A
 
     meta = read_job(job_id)
     ensure_job_access(meta, user_id)
-    pid = meta.get("pid")
-    was_running = bool(meta.get("status") == "running" and is_job_process_running(meta))
-    logger.info(
-        "[cancel_job] before kill: job_id=%s status=%s pid=%s is_running=%s",
-        job_id,
-        meta.get("status"),
-        pid,
-        was_running,
-    )
 
-    if was_running:
-        if os.name == "nt":
-            result = subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            logger.info(
-                "[cancel_job] taskkill result: job_id=%s pid=%s returncode=%s stdout=%s stderr=%s",
-                job_id,
-                pid,
-                result.returncode,
-                (result.stdout or "").strip(),
-                (result.stderr or "").strip(),
-            )
-        else:
-            os.killpg(pid, signal.SIGTERM)
-            logger.info("[cancel_job] sent SIGTERM to process group: job_id=%s pid=%s", job_id, pid)
+    cancel_event = LONG_JOB_CANCEL_EVENTS.setdefault(job_id, threading.Event())
+    cancel_event.set()
 
-    is_running_after = bool(meta.get("status") == "running" and is_job_process_running(meta))
-    logger.info(
-        "[cancel_job] after kill check: job_id=%s pid=%s is_running=%s",
-        job_id,
-        pid,
-        is_running_after,
-    )
-
-    meta["status"] = "cancelled"
-    meta["updated_at"] = utc_now()
-    write_json(job_meta_path(job_id), meta)
+    current_status = str(meta.get("status", "")).lower()
+    if current_status in {"queued", "pending", "running"}:
+        meta["status"] = "cancelled"
+        meta["updated_at"] = utc_now()
+        meta["error"] = "Cancelled by user"
+        write_json(job_meta_path(job_id), meta)
 
     # Đồng bộ manifest để UI không giữ trạng thái chunk "running" sau khi cancel.
     mpath = manifest_path(job_id)
@@ -856,7 +972,7 @@ def cancel_job(job_id: str, user_id: Optional[str] = Query(None)) -> Dict[str, A
         try:
             manifest = read_json(mpath)
             chunks = manifest.get("chunks") or []
-            active_chunk_statuses = {"running", "queued", "pending"}
+            active_chunk_statuses = {"running", "queued", "pending", "retrying"}
             for chunk in chunks:
                 st = str(chunk.get("status", "")).lower()
                 if st in active_chunk_statuses:
