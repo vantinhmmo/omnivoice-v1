@@ -38,6 +38,8 @@ const DEFAULT_SETTINGS: SettingsState = {
   speed: '1.0',
   pause_scale: '1.0',
   chunk_workers: '1',
+  chunk_retries: '2',
+  chunk_retry_delay: '2',
   comma_pause: '0.18',
   sentence_pause: '0.45',
   paragraph_pause: '0.75',
@@ -203,6 +205,7 @@ function statusLabel(status: string): string {
     pending: 'Chờ',
     running: 'Đang chạy',
     done: 'Xong',
+    retrying: 'Thử lại',
     failed: 'Lỗi',
     cancelled: 'Đã hủy',
     stopped: 'Dừng',
@@ -780,6 +783,27 @@ export default function App() {
                   onChange={(e) => setSettings({ chunk_workers: e.target.value })}
                 />
                 <small>Render nhiều chunk song song trong 1 kịch bản. GPU 16GB nên thử 2 trước.</small>
+              </label>
+              <label>Chunk retries
+                <input
+                  type="number"
+                  min="0"
+                  max="10"
+                  step="1"
+                  value={String(settings.chunk_retries)}
+                  onChange={(e) => setSettings({ chunk_retries: e.target.value })}
+                />
+                <small>Số lần thử lại cho mỗi chunk lỗi trước khi đánh dấu failed.</small>
+              </label>
+              <label>Retry delay
+                <input
+                  type="number"
+                  min="0"
+                  step="0.5"
+                  value={String(settings.chunk_retry_delay)}
+                  onChange={(e) => setSettings({ chunk_retry_delay: e.target.value })}
+                />
+                <small>Thời gian chờ giữa các lần retry, tính bằng giây.</small>
               </label>
             </div>
             <div className="group checks">

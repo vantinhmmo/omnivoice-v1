@@ -46,6 +46,14 @@ try:
     DEFAULT_CHUNK_WORKERS = max(1, int(os.environ.get("OMNIVOICE_CHUNK_WORKERS", "1").strip()))
 except ValueError:
     DEFAULT_CHUNK_WORKERS = 1
+try:
+    DEFAULT_CHUNK_RETRIES = max(0, int(os.environ.get("OMNIVOICE_CHUNK_RETRIES", "2").strip()))
+except ValueError:
+    DEFAULT_CHUNK_RETRIES = 2
+try:
+    DEFAULT_CHUNK_RETRY_DELAY = max(0.0, float(os.environ.get("OMNIVOICE_CHUNK_RETRY_DELAY", "2").strip()))
+except ValueError:
+    DEFAULT_CHUNK_RETRY_DELAY = 2.0
 RESET_JOBS_ON_START = str2bool(os.environ.get("OMNIVOICE_RESET_JOBS_ON_START", "true"))
 
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
@@ -573,6 +581,8 @@ def health() -> Dict[str, Any]:
         "anti_spam_version": "guard-atomic-v1",
         "max_concurrent_long_jobs": MAX_CONCURRENT_LONG_JOBS,
         "chunk_workers": DEFAULT_CHUNK_WORKERS,
+        "chunk_retries": DEFAULT_CHUNK_RETRIES,
+        "chunk_retry_delay": DEFAULT_CHUNK_RETRY_DELAY,
         **queue_stats,
     }
 
@@ -671,6 +681,8 @@ async def create_long_job(
     paragraph_pause: float = Form(0.75),
     postprocess_output: bool = Form(True),
     chunk_workers: Optional[int] = Form(None),
+    chunk_retries: Optional[int] = Form(None),
+    chunk_retry_delay: Optional[float] = Form(None),
 ) -> Dict[str, Any]:
     if not script_text and (script_file is None or not script_file.filename):
         raise HTTPException(status_code=400, detail="script_text or script_file is required")
@@ -689,6 +701,8 @@ async def create_long_job(
 
         ref_path = await save_upload(ref_audio, jdir / "reference.wav")
         job_chunk_workers = max(1, int(chunk_workers or DEFAULT_CHUNK_WORKERS))
+        job_chunk_retries = max(0, int(chunk_retries if chunk_retries is not None else DEFAULT_CHUNK_RETRIES))
+        job_chunk_retry_delay = max(0.0, float(chunk_retry_delay if chunk_retry_delay is not None else DEFAULT_CHUNK_RETRY_DELAY))
         output_ext = "mp3" if output_format.lower() == "mp3" else "wav"
         output_path = jdir / f"final.{output_ext}"
         work_dir = jdir / "work"
@@ -734,6 +748,10 @@ async def create_long_job(
             DEFAULT_DTYPE,
             "--chunk_workers",
             str(job_chunk_workers),
+            "--chunk_retries",
+            str(job_chunk_retries),
+            "--chunk_retry_delay",
+            str(job_chunk_retry_delay),
             "--resume",
             "true",
         ]
@@ -757,6 +775,8 @@ async def create_long_job(
             "work_dir": str(work_dir),
             "log": str(log_path),
             "chunk_workers": job_chunk_workers,
+            "chunk_retries": job_chunk_retries,
+            "chunk_retry_delay": job_chunk_retry_delay,
             "command": cmd,
         }
         write_json(job_meta_path(job_id), meta)

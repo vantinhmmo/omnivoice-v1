@@ -227,10 +227,42 @@ def split_long_text(
 
 def atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, path)
+
+    max_attempts = 20
+    base_delay = 0.05
+    last_error: Optional[BaseException] = None
+
+    for attempt in range(1, max_attempts + 1):
+        tmp_path = path.with_name(
+            f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}"
+        )
+
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        try:
+            os.replace(tmp_path, path)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+            if attempt < max_attempts:
+                time.sleep(base_delay * attempt)
+                continue
+            raise
+        except Exception:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
+    if last_error is not None:
+        raise last_error
 
 
 def read_text_file(path: Path) -> str:
@@ -284,6 +316,8 @@ def make_manifest(
             "audio_chunk_threshold": args.audio_chunk_threshold,
             "speed": args.speed,
             "chunk_workers": args.chunk_workers,
+            "chunk_retries": args.chunk_retries,
+            "chunk_retry_delay": args.chunk_retry_delay,
         },
         "split": {
             "max_chars": args.max_chars,
@@ -456,6 +490,8 @@ def render_chunks(
 ) -> Dict[str, Any]:
     gen_config = build_generation_config(args)
     chunk_workers = max(1, int(getattr(args, "chunk_workers", 1) or 1))
+    chunk_retries = max(0, int(getattr(args, "chunk_retries", 0) or 0))
+    chunk_retry_delay = max(0.0, float(getattr(args, "chunk_retry_delay", 0.0) or 0.0))
     manifest_lock = threading.Lock()
 
     voice_clone_prompt = None
@@ -488,61 +524,101 @@ def render_chunks(
             wav_path,
         )
 
-        start = time.time()
-        with manifest_lock:
-            record["status"] = "running"
-            record["error"] = None
-            record["updated_at"] = utc_now()
-            write_manifest_locked()
+        total_start = time.time()
+        max_attempts = chunk_retries + 1
+        last_error: Optional[BaseException] = None
 
-        try:
-            generation_kwargs: Dict[str, Any] = {
-                "text": record["text"],
-                "language": args.language,
-                "generation_config": gen_config,
-            }
-            if voice_clone_prompt is not None:
-                generation_kwargs["voice_clone_prompt"] = voice_clone_prompt
-            elif args.instruct:
-                generation_kwargs["instruct"] = args.instruct
-
-            if args.speed is not None and args.speed > 0 and args.speed != 1.0:
-                generation_kwargs["speed"] = args.speed
-
-            with torch.inference_mode():
-                audio = model.generate(**generation_kwargs)[0]
-
-            elapsed = time.time() - start
-            duration = float(audio.shape[-1]) / float(model.sampling_rate)
-            save_audio_atomic(wav_path, audio, model.sampling_rate)
-
+        for attempt in range(1, max_attempts + 1):
+            attempt_start = time.time()
             with manifest_lock:
-                record["status"] = "done"
-                record["duration"] = duration
-                record["elapsed"] = elapsed
+                record["status"] = "running"
+                record["attempt"] = attempt
+                record["max_attempts"] = max_attempts
                 record["error"] = None
                 record["updated_at"] = utc_now()
                 write_manifest_locked()
-            logger.info(
-                "[%d/%d] Done: duration=%.2fs elapsed=%.2fs rtf=%.3f",
-                idx + 1,
-                total,
-                duration,
-                elapsed,
-                elapsed / duration if duration > 0 else float("inf"),
-            )
-        except Exception as e:
-            with manifest_lock:
-                record["status"] = "failed"
-                record["elapsed"] = time.time() - start
-                record["error"] = f"{type(e).__name__}: {e}"
-                record["updated_at"] = utc_now()
-                write_manifest_locked()
-            logger.exception("[%d/%d] Failed", idx + 1, total)
-            if not args.continue_on_error:
-                raise
-        finally:
-            clear_device_cache()
+
+            try:
+                generation_kwargs: Dict[str, Any] = {
+                    "text": record["text"],
+                    "language": args.language,
+                    "generation_config": gen_config,
+                }
+                if voice_clone_prompt is not None:
+                    generation_kwargs["voice_clone_prompt"] = voice_clone_prompt
+                elif args.instruct:
+                    generation_kwargs["instruct"] = args.instruct
+
+                if args.speed is not None and args.speed > 0 and args.speed != 1.0:
+                    generation_kwargs["speed"] = args.speed
+
+                logger.info(
+                    "[%d/%d] Attempt %d/%d",
+                    idx + 1,
+                    total,
+                    attempt,
+                    max_attempts,
+                )
+                with torch.inference_mode():
+                    audio = model.generate(**generation_kwargs)[0]
+
+                elapsed = time.time() - total_start
+                duration = float(audio.shape[-1]) / float(model.sampling_rate)
+                save_audio_atomic(wav_path, audio, model.sampling_rate)
+
+                with manifest_lock:
+                    record["status"] = "done"
+                    record["duration"] = duration
+                    record["elapsed"] = elapsed
+                    record["attempt"] = attempt
+                    record["max_attempts"] = max_attempts
+                    record["error"] = None
+                    record["updated_at"] = utc_now()
+                    write_manifest_locked()
+                logger.info(
+                    "[%d/%d] Done: duration=%.2fs elapsed=%.2fs rtf=%.3f attempt=%d/%d",
+                    idx + 1,
+                    total,
+                    duration,
+                    elapsed,
+                    elapsed / duration if duration > 0 else float("inf"),
+                    attempt,
+                    max_attempts,
+                )
+                return
+            except Exception as e:
+                last_error = e
+                clear_device_cache()
+                attempt_elapsed = time.time() - attempt_start
+                total_elapsed = time.time() - total_start
+                should_retry = attempt < max_attempts
+                with manifest_lock:
+                    record["status"] = "retrying" if should_retry else "failed"
+                    record["elapsed"] = total_elapsed
+                    record["attempt"] = attempt
+                    record["max_attempts"] = max_attempts
+                    record["error"] = f"{type(e).__name__}: {e}"
+                    record["updated_at"] = utc_now()
+                    write_manifest_locked()
+                logger.exception(
+                    "[%d/%d] Failed attempt %d/%d after %.2fs",
+                    idx + 1,
+                    total,
+                    attempt,
+                    max_attempts,
+                    attempt_elapsed,
+                )
+                if should_retry:
+                    if chunk_retry_delay > 0:
+                        time.sleep(chunk_retry_delay)
+                    continue
+                if not args.continue_on_error:
+                    raise
+            finally:
+                clear_device_cache()
+
+        if last_error is not None and not args.continue_on_error:
+            raise last_error
 
     total = len(manifest["chunks"])
     pending_records = [
@@ -821,6 +897,18 @@ def get_parser() -> argparse.ArgumentParser:
             "Number of chunks to render concurrently inside one long-text job. "
             "Experimental; increase only if GPU VRAM is sufficient."
         ),
+    )
+    parser.add_argument(
+        "--chunk_retries",
+        type=int,
+        default=max(0, int(os.environ.get("OMNIVOICE_CHUNK_RETRIES", "2").strip() or "2")),
+        help="Number of retries for each failed chunk before marking it failed.",
+    )
+    parser.add_argument(
+        "--chunk_retry_delay",
+        type=float,
+        default=max(0.0, float(os.environ.get("OMNIVOICE_CHUNK_RETRY_DELAY", "2").strip() or "2")),
+        help="Seconds to wait between chunk retry attempts.",
     )
 
     return parser

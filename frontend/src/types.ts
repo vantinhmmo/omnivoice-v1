@@ -7,6 +7,8 @@ export type Health = {
   model_loaded: boolean;
   max_concurrent_long_jobs?: number;
   chunk_workers?: number;
+  chunk_retries?: number;
+  chunk_retry_delay?: number;
   running_long_jobs?: number;
   queued_long_jobs?: number;
   active_long_jobs?: number;
@@ -37,6 +39,8 @@ export type JobManifest = {
     chars: number;
     pause_after?: number;
     pause_reason?: string;
+    attempt?: number;
+    max_attempts?: number;
     duration?: number;
     elapsed?: number;
     error?: string | null;
