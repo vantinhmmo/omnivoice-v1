@@ -131,11 +131,28 @@ if errorlevel 1 (
 )
 
 echo [STEP] Starting Cloudflare tunnel for API...
-start "OmniVoice CF API" /D "%CD%" cmd /k "cloudflared tunnel --url http://%BACKEND_HOST%:%BACKEND_PORT%"
+if exist "tmp_cf_api.log" del /f /q "tmp_cf_api.log" >nul 2>nul
+if exist "tmp_cf_frontend.log" del /f /q "tmp_cf_frontend.log" >nul 2>nul
+start "OmniVoice CF API" /D "%CD%" cmd /k "cloudflared tunnel --url http://%BACKEND_HOST%:%BACKEND_PORT% 1> tmp_cf_api.log 2>&1"
 
-echo [STEP] Starting Cloudflare tunnel for Frontend...
-start "OmniVoice CF Frontend" /D "%CD%" cmd /k "cloudflared tunnel --url http://%FRONTEND_HOST%:%FRONTEND_PORT%"
+ echo [STEP] Starting Cloudflare tunnel for Frontend...
+start "OmniVoice CF Frontend" /D "%CD%" cmd /k "cloudflared tunnel --url http://%FRONTEND_HOST%:%FRONTEND_PORT% 1> tmp_cf_frontend.log 2>&1"
 
 echo [INFO] Cloudflare windows opened: OmniVoice CF API / OmniVoice CF Frontend
-echo [INFO] Copy URL https://*.trycloudflare.com shown in each window.
+echo [INFO] Parsing public URLs from tunnel logs...
+set "CF_URL="
+for /f "delims=" %%U in ('powershell -NoProfile -ExecutionPolicy Bypass -Command "$log='%CD%\\tmp_cf_api.log'; $pattern='https://[-a-zA-Z0-9]+\.trycloudflare\.com'; $deadline=(Get-Date).AddSeconds([int]$env:CLOUDFLARE_TUNNEL_TIMEOUT); while((Get-Date) -lt $deadline){ if(Test-Path $log){ $m=Select-String -Path $log -Pattern $pattern | Select-Object -First 1; if($m){ $u=[regex]::Match($m.Line,$pattern).Value; if($u){ Write-Output $u; exit 0 } } } Start-Sleep -Milliseconds 500 }; exit 1"') do set "CF_URL=%%U"
+if defined CF_URL (
+  echo [OK] Public API URL: %CF_URL%
+) else (
+  echo [WARN] API public URL not parsed yet. Check window: OmniVoice CF API
+)
+
+set "CF_URL="
+for /f "delims=" %%U in ('powershell -NoProfile -ExecutionPolicy Bypass -Command "$log='%CD%\\tmp_cf_frontend.log'; $pattern='https://[-a-zA-Z0-9]+\.trycloudflare\.com'; $deadline=(Get-Date).AddSeconds([int]$env:CLOUDFLARE_TUNNEL_TIMEOUT); while((Get-Date) -lt $deadline){ if(Test-Path $log){ $m=Select-String -Path $log -Pattern $pattern | Select-Object -First 1; if($m){ $u=[regex]::Match($m.Line,$pattern).Value; if($u){ Write-Output $u; exit 0 } } } Start-Sleep -Milliseconds 500 }; exit 1"') do set "CF_URL=%%U"
+if defined CF_URL (
+  echo [OK] Public Frontend URL: %CF_URL%
+) else (
+  echo [WARN] Frontend public URL not parsed yet. Check window: OmniVoice CF Frontend
+)
 exit /b 0
