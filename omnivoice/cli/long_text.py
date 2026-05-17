@@ -677,6 +677,7 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default=None, help="cuda, cuda:0, cpu, mps, ...")
     parser.add_argument(
         "--dtype",
+        type=lambda value: value.strip().lower(),
         choices=["auto", "float16", "bfloat16", "float32"],
         default="auto",
     )

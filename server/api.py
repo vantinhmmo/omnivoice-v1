@@ -39,9 +39,9 @@ from omnivoice.utils.common import str2bool
 ROOT_DIR = Path(__file__).resolve().parents[1]
 JOBS_DIR = ROOT_DIR / "jobs"
 SHORT_DIR = ROOT_DIR / "outputs" / "short"
-DEFAULT_MODEL = os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice")
-DEFAULT_DEVICE = os.environ.get("OMNIVOICE_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
-DEFAULT_DTYPE = os.environ.get("OMNIVOICE_DTYPE", "auto")
+DEFAULT_MODEL = os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice").strip()
+DEFAULT_DEVICE = os.environ.get("OMNIVOICE_DEVICE", "cuda" if torch.cuda.is_available() else "cpu").strip()
+DEFAULT_DTYPE = os.environ.get("OMNIVOICE_DTYPE", "auto").strip().lower()
 RESET_JOBS_ON_START = str2bool(os.environ.get("OMNIVOICE_RESET_JOBS_ON_START", "true"))
 
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
